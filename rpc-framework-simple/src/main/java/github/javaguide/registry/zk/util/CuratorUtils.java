@@ -9,6 +9,7 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.imps.CuratorFrameworkState;
 import org.apache.curator.framework.recipes.cache.PathChildrenCache;
 import org.apache.curator.framework.recipes.cache.PathChildrenCacheListener;
+import org.apache.curator.framework.state.ConnectionState;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
 
@@ -19,6 +20,7 @@ import java.util.Properties;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Curator(zookeeper client) 工具类
@@ -37,6 +39,8 @@ public final class CuratorUtils {
     private static final Map<String, List<String>> SERVICE_ADDRESS_MAP = new ConcurrentHashMap<>();
     // 注册路径集合 
     private static final Set<String> REGISTERED_PATH_SET = ConcurrentHashMap.newKeySet();
+    // 会话失效后需要重注册
+    private static final AtomicBoolean NEED_REREGISTER = new AtomicBoolean(false);
     // Zookeeper客户端
     private static CuratorFramework zkClient;
     // 默认Zookeeper地址
@@ -125,6 +129,7 @@ public final class CuratorUtils {
                 .connectString(zookeeperAddress)
                 .retryPolicy(retryPolicy)
                 .build();
+        addConnectionStateListener(zkClient);
         zkClient.start();
         try {
             // wait 30s until connect to the zookeeper
@@ -137,8 +142,28 @@ public final class CuratorUtils {
         return zkClient;
     }
 
+    private static void addConnectionStateListener(CuratorFramework zkClient) {
+        zkClient.getConnectionStateListenable().addListener((client, newState) -> {
+            if (newState == ConnectionState.LOST) {
+                NEED_REREGISTER.set(true);
+                log.warn("Zookeeper session lost, will re-register ephemeral nodes after reconnect.");
+                return;
+            }
+            if (newState == ConnectionState.RECONNECTED && NEED_REREGISTER.compareAndSet(true, false)) {
+                reRegisterEphemeralNodes(client);
+            }
+        });
+    }
+
+    private static void reRegisterEphemeralNodes(CuratorFramework zkClient) {
+        for (String path : REGISTERED_PATH_SET) {
+            createEphemeralNode(zkClient, path);
+        }
+        log.info("Re-registered services after reconnect, paths: [{}]", REGISTERED_PATH_SET);
+    }
+
     /**
-     * Registers to listen for changes to the specified node
+     * 监听指定节点的变化
      *
      * @param rpcServiceName rpc service name eg:github.javaguide.HelloServicetest2version
      */
@@ -157,12 +182,18 @@ public final class CuratorUtils {
      * */
     public static void createEphemeralNode(CuratorFramework zkClient, String path) {
         try {
-            // 创建临时节点（EPHEMERAL 模式）
-            String createdPath = zkClient.create()
-                    .creatingParentsIfNeeded()
-                    .withMode(CreateMode.EPHEMERAL)  // 指定为临时节点
-                    .withACL(org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE)  // 设置ACL
-                    .forPath(path, "status:ok".getBytes());  // 指定节点路径和数据
+            if (zkClient.checkExists().forPath(path) != null) {
+                log.info("The node already exists. The node is:[{}]", path);
+            } else {
+                // 创建临时节点（EPHEMERAL 模式）
+                zkClient.create()
+                        .creatingParentsIfNeeded()
+                        .withMode(CreateMode.EPHEMERAL)  // 指定为临时节点
+                        .withACL(org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE)  // 设置ACL
+                        .forPath(path, "status:ok".getBytes());  // 指定节点路径和数据
+                log.info("The ephemeral node was created successfully. The node is:[{}]", path);
+            }
+            REGISTERED_PATH_SET.add(path);
         } catch (Exception e) {
             log.error("创建临时结点失败!", e);
         }

@@ -13,7 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
  */
 @Slf4j
 public class ChannelProvider {
-    // 通道Map 用于存储通道
+    // channel Map 建立InetSocketAddress与Channel的映射关系
     private final Map<String, Channel> channelMap;
 
     /**

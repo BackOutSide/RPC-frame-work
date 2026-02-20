@@ -28,8 +28,14 @@ public class ZkServiceProviderImpl implements ServiceProvider {
      * key: rpc service name(interface name + version + group)
      * value: service object
      */
+
+    // 本地缓存服务对象 建立RpcServiceName与服务对象的映射关系
     private final Map<String, Object> serviceMap;
+
+    // 已注册的服务名称集合 用于避免重复注册
     private final Set<String> registeredService;
+
+    // 服务注册接口 用于将服务注册到注册中心zookeeper
     private final ServiceRegistry serviceRegistry;
 
     public ZkServiceProviderImpl() {
@@ -38,6 +44,11 @@ public class ZkServiceProviderImpl implements ServiceProvider {
         serviceRegistry = ExtensionLoader.getExtensionLoader(ServiceRegistry.class).getExtension(ServiceRegistryEnum.ZK.getName());
     }
 
+    /**
+     * 添加本地服务
+     * 
+     * @param rpcServiceConfig 服务配置
+     */
     @Override
     public void addService(RpcServiceConfig rpcServiceConfig) {
         String rpcServiceName = rpcServiceConfig.getRpcServiceName();
@@ -49,6 +60,12 @@ public class ZkServiceProviderImpl implements ServiceProvider {
         log.info("Add service: {} and interfaces:{}", rpcServiceName, rpcServiceConfig.getService().getClass().getInterfaces());
     }
 
+    /**
+     * 获取本地服务
+     * 
+     * @param rpcServiceName 服务名称
+     * @return 服务对象
+     */
     @Override
     public Object getService(String rpcServiceName) {
         Object service = serviceMap.get(rpcServiceName);
@@ -58,6 +75,10 @@ public class ZkServiceProviderImpl implements ServiceProvider {
         return service;
     }
 
+    /**
+     * 发布zookeeper服务
+     * 
+     */
     @Override
     public void publishService(RpcServiceConfig rpcServiceConfig) {
         try {

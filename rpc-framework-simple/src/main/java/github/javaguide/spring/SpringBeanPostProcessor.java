@@ -49,7 +49,6 @@ public class SpringBeanPostProcessor implements BeanPostProcessor {
         this.rpcClient = ExtensionLoader.getExtensionLoader(RpcRequestTransport.class).getExtension(RpcRequestTransportEnum.NETTY.getName());
     }
 
-
     /**
      * 对带有@RpcSerivce注解的类进行代理，直接将类发布到ZK上
      * 
