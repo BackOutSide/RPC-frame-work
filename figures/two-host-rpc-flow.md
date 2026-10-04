@@ -1,0 +1,62 @@
+# Two-host RPC Flow
+
+<!-- markdownlint-disable MD013 -->
+
+该图展示服务消费者与服务提供者位于两台主机时，从服务注册、服务发现到一次 RPC 请求完成的完整链路。
+
+```mermaid
+%%{init: {"theme": "base", "themeVariables": {"fontFamily": "Arial, Microsoft YaHei, sans-serif", "primaryColor": "#EFF6FF", "primaryTextColor": "#1F2937", "primaryBorderColor": "#2563EB", "lineColor": "#374151", "secondaryColor": "#ECFDF5", "tertiaryColor": "#FFF7ED", "noteBkgColor": "#FFFBEB", "noteBorderColor": "#D97706"}}}%%
+sequenceDiagram
+    autonumber
+
+    box rgb(239, 246, 255) 主机 A：服务消费者
+        participant Bean as Consumer Bean<br/>@RpcReference
+        participant Proxy as JDK 动态代理<br/>RpcClientProxy
+        participant Client as NettyRpcClient<br/>发现、连接、Future、Pipeline
+    end
+
+    participant ZK as ZooKeeper<br/>注册中心
+
+    box rgb(236, 253, 245) 主机 B：服务提供者
+        participant SPipe as Server Pipeline<br/>FrameDecoder + Codec
+        participant Handler as 业务线程组<br/>RpcRequestHandler
+        participant Service as Service Bean<br/>@RpcService
+    end
+
+    Note over Bean,Proxy: SpringBeanPostProcessor 为 @RpcReference 字段注入 JDK 代理
+    Service->>ZK: Spring 启动时通过 Provider 注册临时节点<br/>/my-rpc/{serviceName}/{ip:9998}
+
+    Bean->>Proxy: 像本地方法一样调用 hello(args)
+    Proxy->>Proxy: 构造 RpcRequest<br/>UUID、接口、方法、参数、group、version
+    Proxy->>Client: sendRpcRequest(request)
+    Client->>ZK: 查询服务地址；首次查询后注册子节点监听
+    ZK-->>Client: 返回可用服务地址列表
+    Client->>Client: 一致性哈希选址；按地址查询 ChannelProvider
+    alt 缓存中无可用 Channel
+        Client->>SPipe: 建立 TCP 连接
+        Client->>Client: 缓存已建立的 Channel
+    else 已有活跃 Channel
+        Client->>Client: 复用 Channel
+    end
+    Client->>Client: UnprocessedRequests.put(UUID, CompletableFuture)
+    Client->>Client: RpcMessageCodec 编码 RpcMessage(request)
+
+    Note over Client,SPipe: 数据面：TCP 双向通信<br/>16B Header = magic(4) + version(1) + fullLength(4) + type(1) + codec(1) + compress(1) + frameRequestId(4)<br/>Body = Hessian 序列化后的 RpcRequest/RpcResponse，再经 Gzip 压缩<br/>LengthFieldBasedFrameDecoder(8 MiB, offset=5, length=4, adjustment=-9, strip=0)
+
+    Client->>SPipe: RPC Request 帧
+    SPipe->>SPipe: 按 fullLength 拆帧；校验 magic/version；解压、反序列化
+    SPipe->>Handler: RpcRequest
+    Handler->>Service: 从本地 serviceMap 按 interface + group + version 定位<br/>并反射调用目标方法
+    Service-->>Handler: 返回业务结果
+    Handler->>SPipe: RpcResponse(result, request.UUID)
+    SPipe-->>Client: RPC Response 帧；客户端 Pipeline 解码
+    Client->>Client: ClientHandler 按 response.UUID<br/>complete 对应 CompletableFuture
+    Client-->>Proxy: resultFuture.get() 返回响应
+    Proxy-->>Bean: 校验响应并返回业务结果
+
+    loop 客户端连续 5 秒写空闲
+        Client->>SPipe: PING 心跳帧
+        SPipe-->>Client: PONG 心跳帧
+    end
+    Note over SPipe,Handler: 服务端连续 30 秒读空闲时关闭连接
+```
