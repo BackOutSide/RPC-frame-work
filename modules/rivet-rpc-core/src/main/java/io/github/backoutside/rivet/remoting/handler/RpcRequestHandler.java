@@ -1,0 +1,56 @@
+package io.github.backoutside.rivet.remoting.handler;
+
+import io.github.backoutside.rivet.exception.RpcException;
+import io.github.backoutside.rivet.factory.SingletonFactory;
+import io.github.backoutside.rivet.provider.ServiceProvider;
+import io.github.backoutside.rivet.provider.impl.ZkServiceProviderImpl;
+import io.github.backoutside.rivet.remoting.dto.RpcRequest;
+import lombok.extern.slf4j.Slf4j;
+
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
+
+/**
+ * RpcRequest processor
+ *
+ * @author shuang.kou
+ * @createTime 2020年05月13日 09:05:00
+ */
+@Slf4j
+public class RpcRequestHandler {
+    private final ServiceProvider serviceProvider;
+
+    public RpcRequestHandler() {
+        serviceProvider = SingletonFactory.getInstance(ZkServiceProviderImpl.class);
+    }
+
+    /**
+     * Processing rpcRequest: call the corresponding method, and then return the method
+     */
+    public Object handle(RpcRequest rpcRequest) {
+        Object service = serviceProvider.getService(rpcRequest.getRpcServiceName());
+        return invokeTargetMethod(rpcRequest, service);
+    }
+
+    /**
+     * get method execution results
+     *
+     * @param rpcRequest client request
+     * @param service    service object
+     * @return the result of the target method execution
+     */
+    private Object invokeTargetMethod(RpcRequest rpcRequest, Object service) {
+        Object result;
+        try {
+            Method method = service.getClass().getMethod(rpcRequest.getMethodName(), rpcRequest.getParamTypes());
+            result = method.invoke(service, rpcRequest.getParameters());
+            log.debug("service:[{}] invoked method:[{}]", rpcRequest.getInterfaceName(), rpcRequest.getMethodName());
+        } catch (InvocationTargetException e) {
+            Throwable target = e.getTargetException();
+            throw new RpcException(target.getMessage() == null ? target.getClass().getName() : target.getMessage(), target);
+        } catch (NoSuchMethodException | IllegalArgumentException | IllegalAccessException e) {
+            throw new RpcException(e.getMessage(), e);
+        }
+        return result;
+    }
+}

@@ -1,0 +1,3 @@
+loadBalance=io.github.backoutside.rivet.loadbalance.loadbalancer.ConsistentHashLoadBalance
+loadBalanceNew=io.github.backoutside.rivet.loadbalance.loadbalancer.ConsistentHashLoadBalanceNew
+leastActiveLoadBalance=io.github.backoutside.rivet.loadbalance.loadbalancer.LeastActiveLoadBalance

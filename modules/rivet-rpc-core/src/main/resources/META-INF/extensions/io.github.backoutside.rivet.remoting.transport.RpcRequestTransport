@@ -1,0 +1,2 @@
+netty=io.github.backoutside.rivet.remoting.transport.netty.client.NettyRpcClient
+socket=io.github.backoutside.rivet.remoting.transport.socket.SocketRpcClient

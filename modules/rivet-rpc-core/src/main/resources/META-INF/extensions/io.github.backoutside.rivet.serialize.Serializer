@@ -1,0 +1,4 @@
+kyro=io.github.backoutside.rivet.serialize.kyro.KryoSerializer
+protostuff=io.github.backoutside.rivet.serialize.protostuff.ProtostuffSerializer
+hessian=io.github.backoutside.rivet.serialize.hessian.HessianSerializer
+jdk=io.github.backoutside.rivet.serialize.jdk.JavaSerializer

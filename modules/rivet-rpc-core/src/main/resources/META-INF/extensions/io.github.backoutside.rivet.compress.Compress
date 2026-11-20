@@ -1,0 +1,1 @@
+gzip=io.github.backoutside.rivet.compress.gzip.GzipCompress
