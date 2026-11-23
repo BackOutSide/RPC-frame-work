@@ -6,6 +6,7 @@ import org.junit.jupiter.api.Test;
 import java.util.UUID;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 
 class HessianSerializerTest {
 
@@ -18,6 +19,7 @@ class HessianSerializerTest {
                 .requestId(UUID.randomUUID().toString())
                 .group("group1")
                 .version("version1")
+                .idempotent(true)
                 .build();
         HessianSerializer hessianSerializer = new HessianSerializer();
         byte[] bytes = hessianSerializer.serialize(target);
@@ -25,5 +27,6 @@ class HessianSerializerTest {
         assertEquals(target.getGroup(), actual.getGroup());
         assertEquals(target.getVersion(), actual.getVersion());
         assertEquals(target.getRequestId(), actual.getRequestId());
+        assertFalse(actual.isIdempotent(), "retry permission must remain local to the client");
     }
 }

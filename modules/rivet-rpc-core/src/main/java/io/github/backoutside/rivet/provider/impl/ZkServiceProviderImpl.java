@@ -1,7 +1,7 @@
 package io.github.backoutside.rivet.provider.impl;
 
 import io.github.backoutside.rivet.config.RpcServiceConfig;
-import io.github.backoutside.rivet.enums.RpcErrorMessageEnum;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import io.github.backoutside.rivet.enums.ServiceRegistryEnum;
 import io.github.backoutside.rivet.exception.RpcException;
 import io.github.backoutside.rivet.extension.ExtensionLoader;
@@ -75,7 +75,8 @@ public class ZkServiceProviderImpl implements ServiceProvider {
     public Object getService(String rpcServiceName) {
         Object service = serviceMap.get(rpcServiceName);
         if (null == service) {
-            throw new RpcException(RpcErrorMessageEnum.SERVICE_CAN_NOT_BE_FOUND);
+            throw new RpcException(RpcStatusCode.SERVICE_NOT_FOUND, null,
+                    "RPC service not found", null);
         }
         return service;
     }

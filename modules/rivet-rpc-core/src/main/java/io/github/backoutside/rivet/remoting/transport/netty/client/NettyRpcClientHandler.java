@@ -1,8 +1,9 @@
 package io.github.backoutside.rivet.remoting.transport.netty.client;
 
 import io.github.backoutside.rivet.enums.CompressTypeEnum;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import io.github.backoutside.rivet.enums.SerializationTypeEnum;
-import io.github.backoutside.rivet.exception.RpcUnavailableException;
+import io.github.backoutside.rivet.exception.RpcException;
 import io.github.backoutside.rivet.factory.SingletonFactory;
 import io.github.backoutside.rivet.remoting.constants.RpcConstants;
 import io.github.backoutside.rivet.remoting.dto.RpcMessage;
@@ -10,6 +11,8 @@ import io.github.backoutside.rivet.remoting.dto.RpcResponse;
 import io.netty.channel.ChannelFutureListener;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.channel.ChannelInboundHandlerAdapter;
+import io.netty.handler.codec.CodecException;
+import io.netty.handler.codec.TooLongFrameException;
 import io.netty.handler.timeout.IdleState;
 import io.netty.handler.timeout.IdleStateEvent;
 import io.netty.util.ReferenceCountUtil;
@@ -27,7 +30,18 @@ public class NettyRpcClientHandler extends ChannelInboundHandlerAdapter {
             if (msg instanceof RpcMessage) {
                 RpcMessage message = (RpcMessage) msg;
                 if (message.getMessageType() == RpcConstants.RESPONSE_TYPE) {
+                    if (!(message.getData() instanceof RpcResponse)
+                            || ((RpcResponse<?>) message.getData()).getRequestId() == null) {
+                        requests.failChannel(ctx.channel(), RpcStatusCode.INVALID_RESPONSE,
+                                "RPC response is missing a valid request ID or body", null);
+                        ctx.close();
+                        return;
+                    }
                     requests.complete((RpcResponse<Object>) message.getData());
+                } else if (message.getMessageType() != RpcConstants.HEARTBEAT_RESPONSE_TYPE) {
+                    requests.failChannel(ctx.channel(), RpcStatusCode.PROTOCOL_ERROR,
+                            "Unexpected RPC message type from provider", null);
+                    ctx.close();
                 }
             }
         } finally {
@@ -52,14 +66,33 @@ public class NettyRpcClientHandler extends ChannelInboundHandlerAdapter {
 
     @Override
     public void channelInactive(ChannelHandlerContext ctx) throws Exception {
-        requests.failChannel(ctx.channel(), new RpcUnavailableException("RPC connection closed"));
+        requests.failChannel(ctx.channel(), RpcStatusCode.CONNECTION_LOST,
+                "RPC connection closed", null);
         super.channelInactive(ctx);
     }
 
     @Override
     public void exceptionCaught(ChannelHandlerContext ctx, Throwable cause) {
         log.warn("RPC client channel failed: {}", ctx.channel().remoteAddress(), cause);
-        requests.failChannel(ctx.channel(), new RpcUnavailableException("RPC connection failed", cause));
+        RpcStatusCode code = classify(cause);
+        requests.failChannel(ctx.channel(), code, "RPC client channel failed", cause);
         ctx.close();
+    }
+
+    private static RpcStatusCode classify(Throwable cause) {
+        boolean codecFailure = false;
+        for (Throwable current = cause; current != null; current = current.getCause()) {
+            if (current instanceof RpcException) {
+                RpcStatusCode code = ((RpcException) current).getKnownStatusCode();
+                if (code == RpcStatusCode.PROTOCOL_ERROR || code == RpcStatusCode.CODEC_ERROR) {
+                    return code;
+                }
+            }
+            if (current instanceof TooLongFrameException) {
+                return RpcStatusCode.PROTOCOL_ERROR;
+            }
+            codecFailure |= current instanceof CodecException;
+        }
+        return codecFailure ? RpcStatusCode.CODEC_ERROR : RpcStatusCode.CONNECTION_LOST;
     }
 }

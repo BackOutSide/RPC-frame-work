@@ -1,6 +1,7 @@
 package io.github.backoutside.rivet.remoting.dto;
 
 import io.github.backoutside.rivet.enums.RpcResponseCodeEnum;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import lombok.*;
 
 import java.io.Serializable;
@@ -69,6 +70,25 @@ public class RpcResponse<T> implements Serializable {
         response.setRequestId(requestId);
         response.setMessage(message == null ? code.getMessage() : message);
         return response;
+    }
+
+    /** Creates a correlated failure response for a status allowed on the wire. */
+    public static <T> RpcResponse<T> fail(RpcStatusCode status, String requestId, String message) {
+        if (status == null || !status.isWireResponse() || status == RpcStatusCode.SUCCESS) {
+            throw new IllegalArgumentException("Status cannot be sent in an RPC failure response");
+        }
+        if (requestId == null || requestId.isBlank()) {
+            throw new IllegalArgumentException("A failure response requires a request ID");
+        }
+        RpcResponse<T> response = new RpcResponse<>();
+        response.setCode(status.getCode());
+        response.setMessage(message == null ? status.getMessage() : message);
+        response.setRequestId(requestId);
+        return response;
+    }
+
+    public static <T> RpcResponse<T> fail(RpcStatusCode status, String requestId) {
+        return fail(status, requestId, null);
     }
 
 }

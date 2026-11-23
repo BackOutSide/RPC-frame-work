@@ -1,7 +1,11 @@
 package io.github.backoutside.rivet.registry.zk.util;
 
 import io.github.backoutside.rivet.config.RpcConfiguration;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import io.github.backoutside.rivet.exception.RpcUnavailableException;
+import io.micrometer.core.instrument.Counter;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Metrics;
 import lombok.extern.slf4j.Slf4j;
 import org.apache.curator.RetryPolicy;
 import org.apache.curator.framework.CuratorFramework;
@@ -9,18 +13,19 @@ import org.apache.curator.framework.CuratorFrameworkFactory;
 import org.apache.curator.framework.imps.CuratorFrameworkState;
 import org.apache.curator.framework.recipes.cache.PathChildrenCache;
 import org.apache.curator.framework.recipes.cache.PathChildrenCacheListener;
-import org.apache.curator.framework.state.ConnectionState;
+import org.apache.curator.framework.recipes.nodes.PersistentNode;
 import org.apache.curator.retry.ExponentialBackoffRetry;
 import org.apache.zookeeper.CreateMode;
+import org.apache.zookeeper.KeeperException;
 
 import java.io.IOException;
 import java.net.InetSocketAddress;
+import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Curator(zookeeper client) 工具类
@@ -35,16 +40,27 @@ public final class CuratorUtils {
     private static final int MAX_RETRIES = 3;
     // 注册根路径
     public static final String ZK_REGISTER_ROOT_PATH = "/my-rpc";
-    // 服务地址映射
-    private static final Map<String, List<String>> SERVICE_ADDRESS_MAP = new ConcurrentHashMap<>();
+    // A successful ZooKeeper read is the only operation that renews a snapshot.
+    private static final Map<String, AddressSnapshot> SERVICE_ADDRESS_MAP = new ConcurrentHashMap<>();
     private static final Map<String, PathChildrenCache> WATCHERS = new ConcurrentHashMap<>();
-    // 注册路径集合 
-    private static final Set<String> REGISTERED_PATH_SET = ConcurrentHashMap.newKeySet();
-    // 会话失效后需要重注册
-    private static final AtomicBoolean NEED_REREGISTER = new AtomicBoolean(false);
+    // PersistentNode retains the desired ephemeral registration across session loss.
+    private static final Map<String, PersistentNode> REGISTERED_NODES = new ConcurrentHashMap<>();
     // Zookeeper客户端
     private static CuratorFramework zkClient;
     // 默认Zookeeper地址
+
+    private static final Counter REFRESH_FAILURES = Metrics.counter("rivet.rpc.registry.refresh.failures");
+
+    static {
+        Gauge.builder("rivet.rpc.registry.cache.age", SERVICE_ADDRESS_MAP, snapshots -> {
+                    long now = System.nanoTime();
+                    return snapshots.values().stream()
+                            .mapToDouble(snapshot -> Math.max(0, now - snapshot.refreshedAtNanos) / 1_000_000_000.0)
+                            .max().orElse(0);
+                })
+                .baseUnit("seconds")
+                .register(Metrics.globalRegistry);
+    }
 
     /**
      * 构造函数
@@ -59,14 +75,13 @@ public final class CuratorUtils {
      */
     public static void createPersistentNode(CuratorFramework zkClient, String path) {
         try {
-            if (REGISTERED_PATH_SET.contains(path) || zkClient.checkExists().forPath(path) != null) {
+            if (zkClient.checkExists().forPath(path) != null) {
                 log.info("The node already exists. The node is:[{}]", path);
             } else {
                 //eg: /my-rpc/io.github.backoutside.rivet.HelloService/127.0.0.1:9999
                 zkClient.create().creatingParentsIfNeeded().withMode(CreateMode.PERSISTENT).forPath(path);
                 log.info("The node was created successfully. The node is:[{}]", path);
             }
-            REGISTERED_PATH_SET.add(path);
         } catch (Exception e) {
             log.error("create persistent node for path [{}] fail", path);
         }
@@ -79,33 +94,61 @@ public final class CuratorUtils {
      * @return All child nodes under the specified node
      */
     public static List<String> getChildrenNodes(CuratorFramework zkClient, String rpcServiceName) {
-        if (SERVICE_ADDRESS_MAP.containsKey(rpcServiceName)) {
-            return SERVICE_ADDRESS_MAP.get(rpcServiceName);
+        AddressSnapshot cached = SERVICE_ADDRESS_MAP.get(rpcServiceName);
+        if (isFresh(cached)) {
+            return cached.addresses;
         }
-        List<String> result = null;
         String servicePath = ZK_REGISTER_ROOT_PATH + "/" + rpcServiceName;
-        try {
-            result = zkClient.getChildren().forPath(servicePath);
-            SERVICE_ADDRESS_MAP.put(rpcServiceName, result);
-            registerWatcher(rpcServiceName, zkClient);
-        } catch (Exception e) {
-            log.error("get children nodes for path [{}] fail", servicePath);
+        if (!zkClient.getZookeeperClient().isConnected()) {
+            REFRESH_FAILURES.increment();
+            throw discoveryFailure(rpcServiceName,
+                    "ZooKeeper is disconnected and no fresh provider snapshot is available", null);
         }
-        return result;
+        AddressSnapshot refreshed = null;
+        try {
+            List<String> result = List.copyOf(zkClient.getChildren().forPath(servicePath));
+            refreshed = new AddressSnapshot(result);
+            SERVICE_ADDRESS_MAP.put(rpcServiceName, refreshed);
+            registerWatcher(rpcServiceName, zkClient);
+            return result;
+        } catch (KeeperException.NoNodeException ex) {
+            // A missing service path is a successful lookup with no providers.
+            AddressSnapshot obsolete = refreshed != null ? refreshed : cached;
+            if (obsolete != null) {
+                SERVICE_ADDRESS_MAP.remove(rpcServiceName, obsolete);
+            }
+            return List.of();
+        } catch (Exception e) {
+            REFRESH_FAILURES.increment();
+            AddressSnapshot obsolete = refreshed != null ? refreshed : cached;
+            if (obsolete != null) {
+                SERVICE_ADDRESS_MAP.remove(rpcServiceName, obsolete);
+            }
+            throw discoveryFailure(rpcServiceName, "Could not refresh RPC provider snapshot", e);
+        }
+    }
+
+    private static boolean isFresh(AddressSnapshot snapshot) {
+        return snapshot != null && System.nanoTime() - snapshot.refreshedAtNanos
+                < TimeUnit.MILLISECONDS.toNanos(RpcConfiguration.current().getZkCacheMaxStaleMs());
+    }
+
+    private static RpcUnavailableException discoveryFailure(String service, String message, Throwable cause) {
+        return new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, null,
+                message + " for " + service, cause);
     }
 
     /**
      * 清空注册地址
      */
     public static void clearRegistry(CuratorFramework zkClient, InetSocketAddress inetSocketAddress) {
-        for (String p : REGISTERED_PATH_SET) {
-            try {
-                if (p.endsWith(inetSocketAddress.toString())) {
-                    zkClient.delete().forPath(p);
-                    REGISTERED_PATH_SET.remove(p);
+        String host = inetSocketAddress.getHostString();
+        String address = (host.contains(":") ? "[" + host + "]" : host) + ":" + inetSocketAddress.getPort();
+        synchronized (REGISTERED_NODES) {
+            for (String path : new ArrayList<>(REGISTERED_NODES.keySet())) {
+                if (path.endsWith("/" + address)) {
+                    closeRegistration(path, REGISTERED_NODES.remove(path));
                 }
-            } catch (Exception e) {
-                log.error("clear registry for path [{}] fail", p);
             }
         }
     }
@@ -129,7 +172,6 @@ public final class CuratorUtils {
                     .connectString(RpcConfiguration.current().getZkAddress())
                     .retryPolicy(retryPolicy)
                     .build();
-            addConnectionStateListener(client);
             client.start();
             try {
                 if (!client.blockUntilConnected(RpcConfiguration.current().getConnectTimeoutMs(), TimeUnit.MILLISECONDS)) {
@@ -158,7 +200,12 @@ public final class CuratorUtils {
         }
         WATCHERS.clear();
         SERVICE_ADDRESS_MAP.clear();
-        REGISTERED_PATH_SET.clear();
+        synchronized (REGISTERED_NODES) {
+            for (Map.Entry<String, PersistentNode> entry : REGISTERED_NODES.entrySet()) {
+                closeRegistration(entry.getKey(), entry.getValue());
+            }
+            REGISTERED_NODES.clear();
+        }
         CuratorFramework client = zkClient;
         zkClient = null;
         if (client != null) {
@@ -166,28 +213,15 @@ public final class CuratorUtils {
         }
     }
 
-    private static void addConnectionStateListener(CuratorFramework zkClient) {
-        zkClient.getConnectionStateListenable().addListener((client, newState) -> {
-            if (newState == ConnectionState.LOST) {
-                NEED_REREGISTER.set(true);
-                log.warn("Zookeeper session lost, will re-register ephemeral nodes after reconnect.");
-                return;
-            }
-            if (newState == ConnectionState.RECONNECTED && NEED_REREGISTER.compareAndSet(true, false)) {
-                reRegisterEphemeralNodes(client);
-            }
-        });
-    }
-
-    private static void reRegisterEphemeralNodes(CuratorFramework zkClient) {
-        for (String path : REGISTERED_PATH_SET) {
-            try {
-                createEphemeralNode(zkClient, path);
-            } catch (RuntimeException ex) {
-                log.error("Could not re-register RPC service {}", path, ex);
-            }
+    private static void closeRegistration(String path, PersistentNode node) {
+        if (node == null) {
+            return;
         }
-        log.info("Re-registered services after reconnect, paths: [{}]", REGISTERED_PATH_SET);
+        try {
+            node.close();
+        } catch (IOException ex) {
+            log.warn("Could not close RPC registration {}", path, ex);
+        }
     }
 
     /**
@@ -199,8 +233,19 @@ public final class CuratorUtils {
         String servicePath = ZK_REGISTER_ROOT_PATH + "/" + rpcServiceName;
         PathChildrenCache pathChildrenCache = new PathChildrenCache(zkClient, servicePath, true);
         PathChildrenCacheListener pathChildrenCacheListener = (curatorFramework, pathChildrenCacheEvent) -> {
-            List<String> serviceAddresses = curatorFramework.getChildren().forPath(servicePath);
-            SERVICE_ADDRESS_MAP.put(rpcServiceName, serviceAddresses);
+            if (!curatorFramework.getZookeeperClient().isConnected()) {
+                return;
+            }
+            try {
+                List<String> serviceAddresses = List.copyOf(curatorFramework.getChildren().forPath(servicePath));
+                SERVICE_ADDRESS_MAP.put(rpcServiceName, new AddressSnapshot(serviceAddresses));
+            } catch (KeeperException.NoNodeException ex) {
+                SERVICE_ADDRESS_MAP.put(rpcServiceName, new AddressSnapshot(List.of()));
+            } catch (Exception ex) {
+                // Retain the last known addresses only until max-stale-ms elapses.
+                REFRESH_FAILURES.increment();
+                log.warn("Could not refresh RPC providers for {} after ZooKeeper event", rpcServiceName, ex);
+            }
         };
         pathChildrenCache.getListenable().addListener(pathChildrenCacheListener);
         PathChildrenCache existing = WATCHERS.putIfAbsent(rpcServiceName, pathChildrenCache);
@@ -220,30 +265,57 @@ public final class CuratorUtils {
      * 创建临时结点
      * */
     public static void createEphemeralNode(CuratorFramework zkClient, String path) {
-        try {
-            if (zkClient.checkExists().forPath(path) != null) {
-                log.info("The node already exists. The node is:[{}]", path);
-            } else {
-                // 创建临时节点（EPHEMERAL 模式）
-                zkClient.create()
-                        .creatingParentsIfNeeded()
-                        .withMode(CreateMode.EPHEMERAL)  // 指定为临时节点
-                        .withACL(org.apache.zookeeper.ZooDefs.Ids.OPEN_ACL_UNSAFE)  // 设置ACL
-                        .forPath(path, "status:ok".getBytes());  // 指定节点路径和数据
-                log.info("The ephemeral node was created successfully. The node is:[{}]", path);
+        synchronized (REGISTERED_NODES) {
+            if (REGISTERED_NODES.containsKey(path)) {
+                return;
             }
-            REGISTERED_PATH_SET.add(path);
-        } catch (Exception e) {
-            log.error("创建临时结点失败!", e);
-            throw new RpcUnavailableException("Could not register RPC service " + path, e);
+            PersistentNode node = new PersistentNode(zkClient, CreateMode.EPHEMERAL, false,
+                    path, "status:ok".getBytes(StandardCharsets.UTF_8), true);
+            try {
+                node.start();
+                if (!node.waitForInitialCreate(RpcConfiguration.current().getConnectTimeoutMs(),
+                        TimeUnit.MILLISECONDS)) {
+                    throw new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, null,
+                            "Timed out registering RPC service " + path, null);
+                }
+                REGISTERED_NODES.put(path, node);
+                log.info("Registered RPC service {} with managed ephemeral node", path);
+            } catch (InterruptedException ex) {
+                Thread.currentThread().interrupt();
+                closeRegistration(path, node);
+                throw new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, null,
+                        "Interrupted registering RPC service " + path, ex);
+            } catch (RuntimeException ex) {
+                closeRegistration(path, node);
+                throw ex instanceof RpcUnavailableException ? ex
+                        : new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, null,
+                                "Could not register RPC service " + path, ex);
+            }
         }
     }
+
     public static void deleteEphemeralNode(CuratorFramework zkClient, String path) {
-        // 方法2：强制删除节点（无论是否有子节点）
+        synchronized (REGISTERED_NODES) {
+            PersistentNode node = REGISTERED_NODES.remove(path);
+            if (node != null) {
+                closeRegistration(path, node);
+                return;
+            }
+        }
         try {
             zkClient.delete().deletingChildrenIfNeeded().forPath(path);
         } catch (Exception e) {
             log.error("删除临时结点：{}失败", path);
+        }
+    }
+
+    private static final class AddressSnapshot {
+        private final List<String> addresses;
+        private final long refreshedAtNanos;
+
+        private AddressSnapshot(List<String> addresses) {
+            this.addresses = addresses;
+            this.refreshedAtNanos = System.nanoTime();
         }
     }
 }

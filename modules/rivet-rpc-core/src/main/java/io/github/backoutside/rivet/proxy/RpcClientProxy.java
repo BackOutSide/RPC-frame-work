@@ -1,13 +1,15 @@
 package io.github.backoutside.rivet.proxy;
 
 import io.github.backoutside.rivet.config.RpcServiceConfig;
-import io.github.backoutside.rivet.enums.RpcErrorMessageEnum;
-import io.github.backoutside.rivet.enums.RpcResponseCodeEnum;
+import io.github.backoutside.rivet.annotation.RpcIdempotent;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import io.github.backoutside.rivet.exception.RpcException;
+import io.github.backoutside.rivet.exception.RpcRejectedException;
+import io.github.backoutside.rivet.exception.RpcRemoteException;
+import io.github.backoutside.rivet.metrics.RpcMetrics;
 import io.github.backoutside.rivet.remoting.dto.RpcRequest;
 import io.github.backoutside.rivet.remoting.dto.RpcResponse;
 import io.github.backoutside.rivet.remoting.transport.RpcRequestTransport;
-import lombok.SneakyThrows;
 import lombok.extern.slf4j.Slf4j;
 
 import java.lang.reflect.InvocationHandler;
@@ -25,8 +27,6 @@ import java.util.UUID;
  */
 @Slf4j
 public class RpcClientProxy implements InvocationHandler {
-
-    private static final String INTERFACE_NAME = "interfaceName";
 
     /**
      * Used to send requests to the server.And there are two implementations: socket and netty
@@ -59,10 +59,19 @@ public class RpcClientProxy implements InvocationHandler {
      * This method is actually called when you use a proxy object to call a method.
      * The proxy object is the object you get through the getProxy method.
      */
-    @SneakyThrows
     @SuppressWarnings("unchecked")
     @Override
     public Object invoke(Object proxy, Method method, Object[] args) {
+        if (method.getDeclaringClass() == Object.class) {
+            return switch (method.getName()) {
+                case "toString" -> "RivetRPC proxy for " + proxy.getClass().getInterfaces()[0].getName();
+                case "hashCode" -> System.identityHashCode(proxy);
+                case "equals" -> proxy == args[0];
+                default -> throw new UnsupportedOperationException(method.getName());
+            };
+        }
+        long started = System.nanoTime();
+        String outcome = "success";
         // 1. 创建一个PRC请求
         log.debug("invoked method: [{}]", method.getName());
         RpcRequest rpcRequest = RpcRequest.builder().methodName(method.getName())
@@ -72,25 +81,47 @@ public class RpcClientProxy implements InvocationHandler {
                 .requestId(UUID.randomUUID().toString())
                 .group(rpcServiceConfig.getGroup())
                 .version(rpcServiceConfig.getVersion())
+                .idempotent(method.isAnnotationPresent(RpcIdempotent.class))
                 .build();
-        // 2. 发送RPC请求
-        RpcResponse<Object> rpcResponse =  (RpcResponse<Object>) rpcRequestTransport.sendRpcRequest(rpcRequest);
-
-        this.check(rpcResponse, rpcRequest);
-        return rpcResponse.getData();
+        try {
+            RpcResponse<Object> rpcResponse = (RpcResponse<Object>) rpcRequestTransport.sendRpcRequest(rpcRequest);
+            outcome = RpcMetrics.outcome(rpcResponse);
+            this.check(rpcResponse, rpcRequest);
+            return rpcResponse.getData();
+        } catch (RuntimeException ex) {
+            if ("success".equals(outcome)) {
+                outcome = RpcMetrics.outcome(ex);
+            }
+            throw ex;
+        } finally {
+            RpcMetrics.client(rpcRequest.getRpcServiceName(), method.getName(),
+                    rpcRequestTransport.getClass().getSimpleName(), outcome, System.nanoTime() - started);
+        }
     }
 
     private void check(RpcResponse<Object> rpcResponse, RpcRequest rpcRequest) {
         if (rpcResponse == null) {
-            throw new RpcException(RpcErrorMessageEnum.SERVICE_INVOCATION_FAILURE, INTERFACE_NAME + ":" + rpcRequest.getInterfaceName());
+            throw invalidResponse(rpcRequest, "RPC returned no response");
         }
 
         if (!rpcRequest.getRequestId().equals(rpcResponse.getRequestId())) {
-            throw new RpcException(RpcErrorMessageEnum.REQUEST_NOT_MATCH_RESPONSE, INTERFACE_NAME + ":" + rpcRequest.getInterfaceName());
+            throw invalidResponse(rpcRequest, "RPC response request ID does not match");
         }
 
-        if (rpcResponse.getCode() == null || !rpcResponse.getCode().equals(RpcResponseCodeEnum.SUCCESS.getCode())) {
-            throw new RpcException("RPC service failed: " + rpcResponse.getMessage());
+        if (rpcResponse.getCode() == null) {
+            throw invalidResponse(rpcRequest, "RPC response has no status code");
         }
+        if (!rpcResponse.getCode().equals(RpcStatusCode.SUCCESS.getCode())) {
+            if (Integer.valueOf(RpcStatusCode.OVERLOADED.getCode()).equals(rpcResponse.getCode())) {
+                throw new RpcRejectedException(rpcResponse.getCode(), rpcRequest.getRequestId(),
+                        "RPC provider overloaded");
+            }
+            throw new RpcRemoteException(rpcResponse.getCode(), rpcResponse.getRequestId(),
+                    rpcResponse.getMessage());
+        }
+    }
+
+    private RpcException invalidResponse(RpcRequest request, String message) {
+        return new RpcException(RpcStatusCode.INVALID_RESPONSE, request.getRequestId(), message, null);
     }
 }

@@ -1,5 +1,7 @@
 package io.github.backoutside.rivet.remoting.transport.netty.client;
 
+import io.github.backoutside.rivet.enums.RpcStatusCode;
+import io.github.backoutside.rivet.exception.RpcException;
 import io.github.backoutside.rivet.exception.RpcUnavailableException;
 import io.github.backoutside.rivet.remoting.dto.RpcResponse;
 import io.netty.channel.Channel;
@@ -22,7 +24,8 @@ public class UnprocessedRequests {
         }
         channelRequests.computeIfAbsent(channel.id(), ignored -> ConcurrentHashMap.newKeySet()).add(requestId);
         if (!channel.isActive()) {
-            failChannel(channel, new RpcUnavailableException("RPC channel closed before send"));
+            failChannel(channel, RpcStatusCode.CONNECTION_LOST,
+                    "RPC channel closed before send", null);
         }
     }
 
@@ -54,6 +57,23 @@ public class UnprocessedRequests {
             PendingRequest request = pending.remove(requestId);
             if (request != null) {
                 request.future.completeExceptionally(cause);
+            }
+        }
+    }
+
+    /** Fail each pending call with its own request ID when the channel cannot carry a reply. */
+    public void failChannel(Channel channel, RpcStatusCode code, String message, Throwable cause) {
+        Set<String> requestIds = channelRequests.remove(channel.id());
+        if (requestIds == null) {
+            return;
+        }
+        for (String requestId : requestIds) {
+            PendingRequest request = pending.remove(requestId);
+            if (request != null) {
+                RpcException failure = code == RpcStatusCode.CONNECTION_LOST
+                        ? new RpcUnavailableException(code, requestId, message, cause)
+                        : new RpcException(code, requestId, message, cause);
+                request.future.completeExceptionally(failure);
             }
         }
     }

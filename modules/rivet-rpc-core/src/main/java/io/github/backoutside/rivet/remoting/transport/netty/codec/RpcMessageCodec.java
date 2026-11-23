@@ -2,7 +2,9 @@ package io.github.backoutside.rivet.remoting.transport.netty.codec;
 
 import io.github.backoutside.rivet.compress.Compress;
 import io.github.backoutside.rivet.enums.CompressTypeEnum;
+import io.github.backoutside.rivet.enums.RpcStatusCode;
 import io.github.backoutside.rivet.enums.SerializationTypeEnum;
+import io.github.backoutside.rivet.exception.RpcException;
 import io.github.backoutside.rivet.extension.ExtensionLoader;
 import io.github.backoutside.rivet.remoting.constants.RpcConstants;
 import io.github.backoutside.rivet.remoting.dto.RpcMessage;
@@ -13,155 +15,168 @@ import io.netty.buffer.ByteBuf;
 import io.netty.channel.ChannelHandler;
 import io.netty.channel.ChannelHandlerContext;
 import io.netty.handler.codec.MessageToMessageCodec;
-import lombok.extern.slf4j.Slf4j;
 
-import java.util.Arrays;
 import java.util.List;
 import java.util.concurrent.atomic.AtomicInteger;
 
-import static io.github.backoutside.rivet.remoting.constants.RpcConstants.HEARTBEAT_REQUEST_TYPE;
-import static io.github.backoutside.rivet.remoting.constants.RpcConstants.HEARTBEAT_RESPONSE_TYPE;
-
-/**
- * @ClassName RpcMessageCodec
- * @Description 可共享的 RPCMessage 编解码器
- * @Author jiangyang1556
- * @Date 2025/9/29 17:04
- * @Version 1.0
- **/
-@Slf4j
+/** Encodes and decodes the current 16-byte RPC header and its optional body. */
 @ChannelHandler.Sharable
 public class RpcMessageCodec extends MessageToMessageCodec<ByteBuf, RpcMessage> {
-    private static final AtomicInteger ATOMIC_INTEGER = new AtomicInteger(0);
-    /**
-     * RPC Message -> ByteBuf
-     */
+    private static final AtomicInteger NEXT_REQUEST_ID = new AtomicInteger();
+
     @Override
-    protected void encode(ChannelHandlerContext ctx, RpcMessage rpcMessage, List<Object> list) throws Exception {
-        /**
-         * request header 16bytes
-         */
-        ByteBuf out = ctx.alloc().buffer();
-        // magic number 4 byte
-        out.writeBytes(RpcConstants.MAGIC_NUMBER);
-        // version 1 byte
-        out.writeByte(RpcConstants.VERSION);
-        // full length 占位
-        out.writeInt(0);
-        // message type 1byte
-        out.writeByte(rpcMessage.getMessageType());
-        // serialize 1 byte
-        out.writeByte(rpcMessage.getCodec());
-        // compress 1byte
-        out.writeByte(rpcMessage.getCompress());
-        // requestId 4 byte
-        out.writeInt(ATOMIC_INTEGER.getAndIncrement());
-        /**
-         * request body
-         */
-        byte[] bodyBytes = null;
-        int fullLength = RpcConstants.HEAD_LENGTH;
-        if(rpcMessage.getMessageType() != HEARTBEAT_REQUEST_TYPE && rpcMessage.getMessageType() != HEARTBEAT_RESPONSE_TYPE) {
-            String serialize = SerializationTypeEnum.getName(rpcMessage.getCodec());
-            Serializer serializer = ExtensionLoader.getExtensionLoader(Serializer.class).getExtension(serialize);
-            bodyBytes = serializer.serialize(rpcMessage.getData());
-            Compress compress = ExtensionLoader.getExtensionLoader(Compress.class).getExtension(CompressTypeEnum.getName(rpcMessage.getCompress()));
-            log.debug("before compress request body size: [{}]", bodyBytes.length);
-            bodyBytes = compress.compress(bodyBytes);
-            log.debug("after compress request body size: [{}]", bodyBytes.length);
-            // 加上请求体长度
-            fullLength += bodyBytes.length;
-        }
-        if(bodyBytes != null) {
-            out.writeBytes(bodyBytes);
-        }
-        // 写入包的长度字段
-        int writeIndex = out.writerIndex();
-        out.writerIndex(RpcConstants.MAGIC_NUMBER.length + 1);
-        out.writeInt(fullLength);
-        out.writerIndex(writeIndex);
+    protected void encode(ChannelHandlerContext ctx, RpcMessage message, List<Object> output) {
+        byte type = message.getMessageType();
+        checkMessageType(type);
+        checkCodecSelection(message.getCodec(), message.getCompress());
 
-        list.add(out);
-    }
-    /**
-     * ByteBuf -> RPC Message
-     */
-    @Override
-    protected void decode(ChannelHandlerContext ctx, ByteBuf in, List<Object> list) throws Exception {
-        /**
-         * 请求头检查
-         */
-        checkMagicNumber(in);
-        checkVersion(in);
-        /**
-         * 处理请求体
-         */
-        int fullLength = in.readInt();
+        ByteBuf frame = ctx.alloc().buffer();
+        boolean handedOff = false;
+        try {
+            frame.writeBytes(RpcConstants.MAGIC_NUMBER);
+            frame.writeByte(RpcConstants.VERSION);
+            frame.writeInt(0);
+            frame.writeByte(type);
+            frame.writeByte(message.getCodec());
+            frame.writeByte(message.getCompress());
+            frame.writeInt(NEXT_REQUEST_ID.getAndIncrement());
 
-        byte messageType = in.readByte();
-        byte codecType = in.readByte();
-        byte compressType = in.readByte();
-        int requestId = in.readInt();
+            if (!isHeartbeat(type)) {
+                if (message.getData() == null) {
+                    throw protocolError("RPC message body is missing", null);
+                }
+                byte[] body;
+                try {
+                    body = serializer(message.getCodec()).serialize(message.getData());
+                    if (body == null) {
+                        throw new IllegalStateException("Serializer returned no bytes");
+                    }
+                    body = compressor(message.getCompress()).compress(body);
+                    if (body == null) {
+                        throw new IllegalStateException("Compressor returned no bytes");
+                    }
+                } catch (RuntimeException cause) {
+                    throw codecError("Could not encode RPC body", cause);
+                }
+                if (body.length > RpcConstants.MAX_FRAME_LENGTH - RpcConstants.HEAD_LENGTH) {
+                    throw protocolError("RPC frame exceeds maximum length", null);
+                }
+                frame.writeBytes(body);
+            }
 
-        RpcMessage rpcMessage = new RpcMessage();
-        rpcMessage.setMessageType(messageType);
-        rpcMessage.setCodec(codecType);
-        rpcMessage.setCompress(compressType);
-        rpcMessage.setRequestId(requestId);
-
-        if (messageType == HEARTBEAT_REQUEST_TYPE) {
-            rpcMessage.setData(RpcConstants.PING);
-            list.add(rpcMessage);
-            return;
-        }
-        if (messageType == HEARTBEAT_RESPONSE_TYPE) {
-            rpcMessage.setData(RpcConstants.PONG);
-            list.add(rpcMessage);
-            return;
-        }
-        /**
-         * rpcMessage data
-         */
-        int bodyLength = fullLength - RpcConstants.HEAD_LENGTH;
-        if (bodyLength > 0) {
-            byte[] bodyBytes = new byte[bodyLength];
-            in.readBytes(bodyBytes);
-            // decompress the bytes
-            String compressName = CompressTypeEnum.getName(compressType);
-            Compress compress = ExtensionLoader.getExtensionLoader(Compress.class).getExtension(compressName);
-            log.debug("before decompress request body size: [{}]", bodyBytes.length);
-            bodyBytes = compress.decompress(bodyBytes);
-            log.debug("after decompress request body size: [{}]", bodyBytes.length);
-            // deserialize
-            String codecName = SerializationTypeEnum.getName(rpcMessage.getCodec());
-            log.debug("codec name: [{}] ", codecName);
-            Serializer serializer = ExtensionLoader.getExtensionLoader(Serializer.class).getExtension(codecName);
-            if (messageType == RpcConstants.REQUEST_TYPE) {
-                RpcRequest rpcRequest = serializer.deserialize(bodyBytes, RpcRequest.class);
-                rpcMessage.setData(rpcRequest);
-            } else {
-                RpcResponse rpcRequest = serializer.deserialize(bodyBytes, RpcResponse.class);
-                rpcMessage.setData(rpcRequest);
+            frame.setInt(RpcConstants.MAGIC_NUMBER.length + 1, frame.readableBytes());
+            output.add(frame);
+            handedOff = true;
+        } finally {
+            if (!handedOff) {
+                frame.release();
             }
         }
-        list.add(rpcMessage);
     }
 
-    private void checkVersion(ByteBuf in) {
-        byte version = in.readByte();
-        if (version != RpcConstants.VERSION) {
-            throw new RuntimeException("协议版本不匹配" + version);
+    @Override
+    protected void decode(ChannelHandlerContext ctx, ByteBuf frame, List<Object> output) {
+        int actualLength = frame.readableBytes();
+        if (actualLength < RpcConstants.HEAD_LENGTH || actualLength > RpcConstants.MAX_FRAME_LENGTH) {
+            throw protocolError("Invalid RPC frame length", null);
+        }
+        checkMagicNumber(frame);
+        checkVersion(frame);
+        int declaredLength = frame.readInt();
+        if (declaredLength != actualLength) {
+            throw protocolError("RPC frame length does not match header", null);
+        }
+
+        byte type = frame.readByte();
+        checkMessageType(type);
+        byte codec = frame.readByte();
+        byte compress = frame.readByte();
+        checkCodecSelection(codec, compress);
+        int requestId = frame.readInt();
+
+        RpcMessage message = RpcMessage.builder()
+                .messageType(type).codec(codec).compress(compress).requestId(requestId).build();
+        if (isHeartbeat(type)) {
+            if (declaredLength != RpcConstants.HEAD_LENGTH) {
+                throw protocolError("RPC heartbeat must not have a body", null);
+            }
+            message.setData(type == RpcConstants.HEARTBEAT_REQUEST_TYPE ? RpcConstants.PING : RpcConstants.PONG);
+            output.add(message);
+            return;
+        }
+
+        int bodyLength = declaredLength - RpcConstants.HEAD_LENGTH;
+        if (bodyLength == 0) {
+            throw protocolError("RPC message body is missing", null);
+        }
+        byte[] body = new byte[bodyLength];
+        frame.readBytes(body);
+        try {
+            body = compressor(compress).decompress(body);
+            if (body == null) {
+                throw new IllegalStateException("Decompressor returned no bytes");
+            }
+            Object data = type == RpcConstants.REQUEST_TYPE
+                    ? serializer(codec).deserialize(body, RpcRequest.class)
+                    : serializer(codec).deserialize(body, RpcResponse.class);
+            if (data == null) {
+                throw new IllegalStateException("Deserializer returned no object");
+            }
+            message.setData(data);
+        } catch (RuntimeException cause) {
+            throw codecError("Could not decode RPC body", cause);
+        }
+        output.add(message);
+    }
+
+    private static boolean isHeartbeat(byte type) {
+        return type == RpcConstants.HEARTBEAT_REQUEST_TYPE || type == RpcConstants.HEARTBEAT_RESPONSE_TYPE;
+    }
+
+    private static void checkMessageType(byte type) {
+        if (type != RpcConstants.REQUEST_TYPE && type != RpcConstants.RESPONSE_TYPE && !isHeartbeat(type)) {
+            throw protocolError("Unknown RPC message type", null);
         }
     }
 
-    private void checkMagicNumber(ByteBuf in) {
-        int len = RpcConstants.MAGIC_NUMBER.length;
-        byte[] tmp = new byte[len];
-        in.readBytes(tmp);
-        for (int i = 0; i < len; i++) {
-            if (tmp[i] != RpcConstants.MAGIC_NUMBER[i]) {
-                throw new IllegalArgumentException("未知魔数: " + Arrays.toString(tmp));
+    private static void checkCodecSelection(byte codec, byte compress) {
+        if (SerializationTypeEnum.getName(codec) == null) {
+            throw codecError("Unknown RPC serializer", null);
+        }
+        if (CompressTypeEnum.getName(compress) == null) {
+            throw codecError("Unknown RPC compression type", null);
+        }
+    }
+
+    private static Serializer serializer(byte code) {
+        return ExtensionLoader.getExtensionLoader(Serializer.class)
+                .getExtension(SerializationTypeEnum.getName(code));
+    }
+
+    private static Compress compressor(byte code) {
+        return ExtensionLoader.getExtensionLoader(Compress.class)
+                .getExtension(CompressTypeEnum.getName(code));
+    }
+
+    private static void checkVersion(ByteBuf frame) {
+        if (frame.readByte() != RpcConstants.VERSION) {
+            throw protocolError("Unsupported RPC protocol version", null);
+        }
+    }
+
+    private static void checkMagicNumber(ByteBuf frame) {
+        for (byte expected : RpcConstants.MAGIC_NUMBER) {
+            if (frame.readByte() != expected) {
+                throw protocolError("Invalid RPC magic number", null);
             }
         }
+    }
+
+    private static RpcException protocolError(String message, Throwable cause) {
+        return new RpcException(RpcStatusCode.PROTOCOL_ERROR, null, message, cause);
+    }
+
+    private static RpcException codecError(String message, Throwable cause) {
+        return new RpcException(RpcStatusCode.CODEC_ERROR, null, message, cause);
     }
 }

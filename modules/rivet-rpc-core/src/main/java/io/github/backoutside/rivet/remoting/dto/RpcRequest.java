@@ -31,6 +31,11 @@ public class RpcRequest implements Serializable {
     private String version;
     // 组 用来处理一个接口有多个实现类的情况
     private String group;
+    /** Client-side retry permission; older peers ignore this added field. */
+    private transient boolean idempotent;
+    /** Optional W3C trace context, independent of the wire request ID. */
+    private String traceparent;
+    private String tracestate;
 
     /**
      * 获取RPC服务名称

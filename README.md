@@ -4,7 +4,7 @@
 
 RivetRPC 是面向 Java 服务的轻量级 RPC 框架，围绕可解释的调用失败、可观测的服务链路和可复现的性能验证持续迭代。当前实现覆盖服务注册与发现、客户端代理、连接复用、自定义协议、序列化与压缩、服务端调用，以及请求与响应关联。
 
-项目从 [JavaGuide 的 guide-rpc-framework](https://github.com/Snailclimb/guide-rpc-framework) 学习实现发展而来，保留原有代码中的作者信息，详见[来源说明](NOTICE.md)。RivetRPC 的后续设计聚焦故障治理、trace、审计与基准测试；这些能力以实际实现和验证结果为准。当前版本尚未完成生产级治理。
+项目从 [JavaGuide 的 guide-rpc-framework](https://github.com/Snailclimb/guide-rpc-framework) 学习实现发展而来，保留原有代码中的作者信息，详见[来源说明](NOTICE.md)。RivetRPC 持续完善故障治理和可观测性。审计与基准测试属于后续工作。
 
 ## 点评业务一期
 
@@ -26,6 +26,8 @@ RivetRPC 是面向 Java 服务的轻量级 RPC 框架，围绕可解释的调用
 - 支持 Hessian、Kryo、Protostuff 序列化实现和 Gzip 压缩；当前示例链路默认使用 Hessian + Gzip。
 - 提供随机、轮询、最少活跃和一致性哈希实现。默认使用随机策略，可通过 `rpc.client.load-balance` 选择。
 - 通过 `@RpcScan`、`@RpcService`、`@RpcReference` 完成服务发布和客户端代理注入。
+- Netty 主链提供一次调用的总时限、实例级熔断、按服务的客户端并发隔离和服务端有界准入；只对接口方法上显式标记 `@RpcIdempotent` 的调用允许跨实例重试。
+- Netty RPC 两端通过 OpenTelemetry 记录 span。全局 RequestID 取自 `traceId`，幂等重试沿用同一链路。见 [Hello 示例运行方式](examples/hello/README.md)。
 
 ## 模块结构
 
@@ -122,7 +124,7 @@ initialBytesStrip = 0
 - Provider 使用临时节点注册实例，并在 JVM ShutdownHook 中主动清理节点和线程池。
 - Consumer 首次发现服务时读取子节点并缓存地址列表，同时注册 `PathChildrenCache`。
 - 节点发生变化时，当前实现重新拉取全部子节点并替换本地缓存。
-- ZooKeeper session 丢失后记录重注册状态，重新连接成功时恢复临时节点。
+- Provider 使用 Curator `PersistentNode` 管理临时注册节点，连接或会话恢复后由该 recipe 持续重建；Consumer 地址快照超过 `rpc.zk.cache.max-stale-ms` 后必须重新读取，注册中心不可用时会失败关闭。
 
 ## 运行入口
 
@@ -153,6 +155,6 @@ initialBytesStrip = 0
 
 - 网络收发与响应回填由 Netty 异步处理。业务调用同步等待结果，并受 RPC 超时控制。
 - RPC 层覆盖连接失败和请求超时。点评秒杀的幂等由业务键与数据库唯一约束实现。
-- 自动重试、限流、熔断、传输鉴权和链路追踪属于后续框架迭代。
+- Netty 支持有界准入、实例级熔断和按总时限进行的幂等重试。传输鉴权属于后续迭代。
 - 注册中心监听是“事件触发后全量刷新”，不是逐条增量更新。
 - 当前版本已具备完整的基础调用链；容错、治理、安全和可观测性仍需实现和验证。

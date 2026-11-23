@@ -30,16 +30,15 @@ public class ChannelProvider {
      */
     public Channel get(InetSocketAddress inetSocketAddress) {
         String key = inetSocketAddress.toString();
-        // determine if there is a connection for the corresponding address
-        if (channelMap.containsKey(key)) {
-            Channel channel = channelMap.get(key);
-            // if so, determine if the connection is available, and if so, get it directly
-            if (channel != null && channel.isActive()) {
-                return channel;
-            } else {
-                channelMap.remove(key);
-            }
+        Channel channel = channelMap.get(key);
+        if (channel == null) {
+            return null;
         }
+        if (channel.isActive()) {
+            return channel;
+        }
+        // A concurrent connect may already have replaced this inactive channel.
+        channelMap.remove(key, channel);
         return null;
     }
 

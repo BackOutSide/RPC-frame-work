@@ -19,6 +19,9 @@ import io.netty.channel.socket.SocketChannel;
 import io.netty.channel.socket.nio.NioServerSocketChannel;
 import io.netty.handler.timeout.IdleStateHandler;
 import io.netty.util.concurrent.DefaultEventExecutorGroup;
+import io.netty.util.concurrent.RejectedExecutionHandlers;
+import io.micrometer.core.instrument.Gauge;
+import io.micrometer.core.instrument.Metrics;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.boot.context.event.ApplicationReadyEvent;
@@ -28,6 +31,8 @@ import org.springframework.context.event.ContextRefreshedEvent;
 import org.springframework.stereotype.Component;
 
 import java.net.InetSocketAddress;
+import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.TimeUnit;
 
 /** The RPC listener is registered with ZooKeeper only after TCP bind succeeds. */
@@ -37,12 +42,23 @@ public class NettyRpcServer implements ApplicationListener<ApplicationEvent>, Di
     /** Legacy demo default. Runtime configuration may override this port. */
     public static final int PORT = 9998;
 
+    // The gauge must observe a stable object across stop/start. Micrometer ignores
+    // registration of a second gauge with the same name and tags.
+    private static final Set<RpcAdmissionHandler> ACTIVE_ADMISSIONS = ConcurrentHashMap.newKeySet();
+
+    static {
+        Gauge.builder("rivet.rpc.server.inflight", ACTIVE_ADMISSIONS,
+                        admissions -> admissions.stream().mapToInt(RpcAdmissionHandler::inFlight).sum())
+                .register(Metrics.globalRegistry);
+    }
+
     private final ZkServiceProviderImpl serviceProvider = ZkServiceProviderImpl.getInstance();
     private EventLoopGroup bossGroup;
     private EventLoopGroup workerGroup;
     private DefaultEventExecutorGroup serviceHandlerGroup;
     private Channel serverChannel;
     private InetSocketAddress advertisedAddress;
+    private RpcAdmissionHandler admission;
 
     public NettyRpcServer() {
         Runtime.getRuntime().addShutdownHook(new Thread(this::stop, "rpc-server-shutdown"));
@@ -79,9 +95,13 @@ public class NettyRpcServer implements ApplicationListener<ApplicationEvent>, Di
         workerGroup = new NioEventLoopGroup();
         serviceHandlerGroup = new DefaultEventExecutorGroup(
                 RuntimeUtil.cpus() * 2,
-                ThreadPoolFactoryUtil.createThreadFactory("rpc-service-handler", false));
+                ThreadPoolFactoryUtil.createThreadFactory("rpc-service-handler", false),
+                config.getServerMaxInflight(), RejectedExecutionHandlers.reject());
         RpcMessageCodec codec = new RpcMessageCodec();
-        NettyRpcServerHandler handler = new NettyRpcServerHandler();
+        RpcAdmissionHandler admission = new RpcAdmissionHandler(config.getServerMaxInflight());
+        this.admission = admission;
+        ACTIVE_ADMISSIONS.add(admission);
+        NettyRpcServerHandler handler = new NettyRpcServerHandler(admission);
         try {
             ServerBootstrap bootstrap = new ServerBootstrap();
             bootstrap.group(bossGroup, workerGroup)
@@ -96,6 +116,7 @@ public class NettyRpcServer implements ApplicationListener<ApplicationEvent>, Di
                             pipeline.addLast(new IdleStateHandler(30, 0, 0, TimeUnit.SECONDS));
                             pipeline.addLast(new RpcMessageFrameDecoder());
                             pipeline.addLast(codec);
+                            pipeline.addLast(admission);
                             pipeline.addLast(serviceHandlerGroup, handler);
                         }
                     });
@@ -112,6 +133,10 @@ public class NettyRpcServer implements ApplicationListener<ApplicationEvent>, Di
     }
 
     public synchronized void stop() {
+        if (admission != null) {
+            ACTIVE_ADMISSIONS.remove(admission);
+            admission = null;
+        }
         if (advertisedAddress != null) {
             try {
                 serviceProvider.unregisterAll();
