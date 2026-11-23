@@ -10,4 +10,11 @@
         <relativePath>../../../pom.xml</relativePath>
     </parent>
     <artifactId>rivet-rpc-example-dianping-api</artifactId>
+    <dependencies>
+        <dependency>
+            <groupId>io.github.backoutside</groupId>
+            <artifactId>rivet-rpc-common</artifactId>
+            <version>${project.version}</version>
+        </dependency>
+    </dependencies>
 </project>

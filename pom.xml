@@ -30,6 +30,7 @@
         <module>examples/dianping/api</module>
         <module>examples/dianping/provider</module>
         <module>examples/dianping/web</module>
+        <module>examples/dianping/probe</module>
     </modules>
     <dependencyManagement>
         <dependencies>

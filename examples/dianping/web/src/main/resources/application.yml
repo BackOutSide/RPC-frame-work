@@ -3,6 +3,8 @@ server:
   port: ${DIANPING_WEB_PORT:18080}
 
 spring:
+  application:
+    name: dianping-web
   data:
     redis:
       host: ${DIANPING_REDIS_HOST:127.0.0.1}
@@ -17,6 +19,7 @@ rpc:
     timeout-ms: ${DIANPING_RPC_TIMEOUT_MS:3000}
     connect-timeout-ms: ${DIANPING_RPC_CONNECT_TIMEOUT_MS:5000}
     load-balance: ${DIANPING_RPC_LOAD_BALANCE:random}
+    max-attempts: ${DIANPING_RPC_MAX_ATTEMPTS:2}
 
 dianping:
   demo-users:
@@ -28,3 +31,16 @@ dianping:
       bob:
         id: 2
         password: ${DIANPING_BOB_PASSWORD:demo-bob}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,metrics,prometheus
+  endpoint:
+    health:
+      show-details: never
+  metrics:
+    distribution:
+      slo:
+        "[rivet.rpc.client.duration]": 50ms,100ms,250ms,500ms,1s,2s,3s,5s

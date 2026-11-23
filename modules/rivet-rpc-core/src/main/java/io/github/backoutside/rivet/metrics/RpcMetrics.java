@@ -42,6 +42,9 @@ public final class RpcMetrics {
         if (response == null) {
             return "unavailable";
         }
+        if (response.getCode() == null) {
+            return "protocol_error";
+        }
         if (Integer.valueOf(RpcStatusCode.SUCCESS.getCode()).equals(response.getCode())) {
             return "success";
         }

@@ -1,0 +1,31 @@
+server:
+  address: ${DIANPING_PROBE_HTTP_BIND_HOST:127.0.0.1}
+  port: ${DIANPING_PROBE_HTTP_PORT:18083}
+
+spring:
+  application:
+    name: rivet-rpc-probe
+
+rpc:
+  zk:
+    address: ${DIANPING_ZK_ADDRESS:127.0.0.1:12181}
+  client:
+    load-balance: round-robin
+    max-attempts: 2
+  server:
+    bind-host: 127.0.0.1
+
+dianping:
+  probe:
+    interval-ms: ${DIANPING_PROBE_INTERVAL_MS:15000}
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,prometheus
+  metrics:
+    distribution:
+      slo:
+        "[rivet.rpc.client.duration]": 50ms,100ms,250ms,500ms,1s,2s,3s,5s
+        "[rivet.rpc.server.duration]": 50ms,100ms,250ms,500ms,1s,2s,3s,5s

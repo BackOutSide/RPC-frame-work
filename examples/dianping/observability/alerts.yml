@@ -1,0 +1,159 @@
+groups:
+  - name: rivet-rpc-dianping
+    rules:
+      # Set this to the desired number of Provider scrape targets in this environment.
+      # The demo Prometheus config must list both Provider targets before using 2.
+      - record: rivet_rpc_provider_expected_scrape_targets
+        expr: vector(2)
+        labels:
+          job: dianping-provider
+
+      # Scrape health is a monitoring signal, not proof that the RPC port is unavailable.
+      - alert: DianpingWebScrapeFailed
+        expr: up{job="dianping-web"} == 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "点评 Web 指标抓取失败：{{ $labels.instance }}"
+          description: "Prometheus 连续 1 分钟无法抓取 Web 指标端点；请独立检查用户入口。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: DianpingWebScrapeTargetMissing
+        expr: absent(up{job="dianping-web"})
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "点评 Web 抓取目标消失"
+          description: "Prometheus 中没有 dianping-web 的 up 时序；检查目标发现和抓取配置。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: DianpingProviderScrapeCoverageLow
+        expr: |
+          (
+            rivet_rpc_provider_expected_scrape_targets{job="dianping-provider"}
+            - on (job)
+            (
+              sum by (job) (up{job="dianping-provider"})
+              or on (job)
+              (rivet_rpc_provider_expected_scrape_targets{job="dianping-provider"} * 0)
+            )
+          ) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "点评 Provider 指标抓取覆盖不足"
+          description: "Provider 成功抓取数低于期望值，当前少 {{ $value }} 个；检查实例与目标发现。"
+          environment: "{{ $externalLabels.environment }}"
+
+      # The denominator and minimum traffic gate both exclude caller cancellation.
+      - alert: RivetRpcClientHighAvailabilityFailureRate
+        expr: |
+          (
+            sum by (service) (rate(rivet_rpc_client_duration_seconds_count{job="dianping-web",outcome=~"timeout|unavailable|rejected|protocol_error"}[5m]))
+            /
+            sum by (service) (rate(rivet_rpc_client_duration_seconds_count{job="dianping-web",outcome!="cancelled"}[5m]))
+          ) > 0.05
+          and on (service)
+          sum by (service) (increase(rivet_rpc_client_duration_seconds_count{job="dianping-web",outcome!="cancelled"}[5m])) >= 20
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          summary: "RPC 调用可用性故障率升高：{{ $labels.service }}"
+          description: "近 5 分钟至少 20 次非取消逻辑调用，超时、不可用、拒绝或协议错误比例持续超过 5%；当前 {{ $value | humanizePercentage }}。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: RivetRpcClientHighP95Latency
+        expr: |
+          histogram_quantile(
+            0.95,
+            sum by (service, le) (rate(rivet_rpc_client_duration_seconds_bucket{job="dianping-web",outcome!="cancelled"}[5m]))
+          ) > 2
+          and on (service)
+          sum by (service) (increase(rivet_rpc_client_duration_seconds_count{job="dianping-web",outcome!="cancelled"}[5m])) >= 20
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC 调用 P95 超过 2 秒：{{ $labels.service }}"
+          description: "近 5 分钟至少 20 次非取消逻辑调用，P95 持续超过 2 秒；当前约 {{ $value }} 秒。"
+          environment: "{{ $externalLabels.environment }}"
+
+      # 60s assumes a probe period well below 60s; tune it with the actual cadence.
+      - alert: RivetRpcProbeConsecutiveFailures
+        expr: |
+          (rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"} >= 3)
+          and on (job, instance, service)
+          (
+            (time() - rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"} >= 0)
+            and on (job, instance, service)
+            (time() - rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"} <= 60)
+          )
+          and on (job, instance) (up{job="rivet-rpc-probe"} == 1)
+        labels:
+          severity: critical
+        annotations:
+          summary: "RPC 探针连续失败：{{ $labels.service }}"
+          description: "{{ $labels.instance }} 的真实 RPC 探针最近一次结果新鲜，且连续失败至少 3 次。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: RivetRpcProbeScrapeFailed
+        expr: up{job="rivet-rpc-probe"} == 0
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC 探针指标抓取失败：{{ $labels.instance }}"
+          description: "探针指标端点不可抓取，不能据此断言 RPC 调用失败。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: RivetRpcProbeScrapeTargetMissing
+        expr: absent(up{job="rivet-rpc-probe"})
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC 探针抓取目标消失"
+          description: "Prometheus 中没有 rivet-rpc-probe 的 up 时序。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: RivetRpcProbeResultMissing
+        expr: |
+          (
+            absent(rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"})
+            or
+            absent(rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"})
+          )
+          and on (job) (sum by (job) (up{job="rivet-rpc-probe"}) > 0)
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC 探针结果缺失：{{ $labels.service }}"
+          description: "连续失败次数或最近完成时间指标缺失，不能判定 RPC 可用性。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: RivetRpcProbeResultStale
+        expr: |
+          (
+            (time() - rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"} > 60)
+            or
+            (time() - rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"} < 0)
+          )
+          and on (job, instance) (up{job="rivet-rpc-probe"} == 1)
+        labels:
+          severity: warning
+        annotations:
+          summary: "RPC 探针结果时间异常：{{ $labels.service }}"
+          description: "{{ $labels.instance }} 的最近完成时间超过 60 秒未更新或位于未来；检查探针与时钟。"
+          environment: "{{ $externalLabels.environment }}"
+
+      - alert: PrometheusRuleEvaluationFailures
+        expr: increase(prometheus_rule_evaluation_failures_total[5m]) > 0
+        for: 1m
+        labels:
+          severity: warning
+        annotations:
+          summary: "Prometheus 规则求值失败"
+          description: "监控规则在最近 5 分钟出现求值错误，告警结果可能不可信。"
+          environment: "{{ $externalLabels.environment }}"

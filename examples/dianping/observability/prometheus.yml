@@ -1,0 +1,36 @@
+global:
+  scrape_interval: 15s
+  scrape_timeout: 5s
+  evaluation_interval: 15s
+  external_labels:
+    environment: local
+
+rule_files:
+  - /etc/prometheus/alerts.yml
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: [alertmanager:9093]
+
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: [localhost:9090]
+
+  # The Java processes run on the host, not in this Compose project.
+  # Their HTTP bind hosts must explicitly allow access from Docker.
+  - job_name: dianping-web
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18080]
+
+  - job_name: dianping-provider
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18081, host.docker.internal:18082]
+
+  - job_name: rivet-rpc-probe
+    metrics_path: /actuator/prometheus
+    static_configs:
+      - targets: [host.docker.internal:18083]

@@ -1,0 +1,59 @@
+name: rpc-dianping-observability
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.16.0
+    extra_hosts:
+      - host.docker.internal:host-gateway
+    ports:
+      - "127.0.0.1:19090:9090"
+    volumes:
+      - ./prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./alerts.yml:/etc/prometheus/alerts.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=15d
+    restart: unless-stopped
+
+  alertmanager:
+    image: quay.io/prometheus/alertmanager:v0.35.0
+    ports:
+      - "127.0.0.1:19093:9093"
+    volumes:
+      - ./alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager-data:/alertmanager
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+      - --storage.path=/alertmanager
+      - --cluster.listen-address=
+    restart: unless-stopped
+
+  notification-receiver:
+    image: python:3.13-slim
+    ports:
+      - "127.0.0.1:19094:8080"
+    volumes:
+      - ./notification_receiver.py:/opt/rivet/notification_receiver.py:ro
+    command: [python, -u, /opt/rivet/notification_receiver.py, --host, 0.0.0.0, --port, "8080"]
+    restart: unless-stopped
+
+  grafana:
+    profiles: [ui]
+    image: grafana/grafana:13.3.0
+    ports:
+      - "127.0.0.1:13000:3000"
+    environment:
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - grafana-data:/var/lib/grafana
+      - ./grafana-datasources.yml:/etc/grafana/provisioning/datasources/rivet-rpc.yml:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus-data:
+  alertmanager-data:
+  grafana-data:

@@ -1,0 +1,510 @@
+rule_files:
+  - alerts.yml
+evaluation_interval: 15s
+
+tests:
+  # A failed scrape keeps its up series at 0. One healthy Provider must prevent
+  # any RPC availability page; the coverage warning reports one missing scrape.
+  - name: one_provider_scrape_down
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="dianping-provider",instance="provider-1:18081"}'
+        values: '0+0x10'
+      - series: 'up{job="dianping-provider",instance="provider-2:18082"}'
+        values: '1+0x10'
+    alert_rule_test:
+      - eval_time: 45s
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts: []
+      - eval_time: 1m15s
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts:
+          - exp_labels:
+              job: dianping-provider
+              severity: warning
+            exp_annotations:
+              summary: 点评 Provider 指标抓取覆盖不足
+              description: Provider 成功抓取数低于期望值，当前少 1 个；检查实例与目标发现。
+              environment: staging
+      - eval_time: 1m15s
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+
+  - name: both_provider_scrapes_down
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="dianping-provider",instance="provider-1:18081"}'
+        values: '0+0x10'
+      - series: 'up{job="dianping-provider",instance="provider-2:18082"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts:
+          - exp_labels:
+              job: dianping-provider
+              severity: warning
+            exp_annotations:
+              summary: 点评 Provider 指标抓取覆盖不足
+              description: Provider 成功抓取数低于期望值，当前少 2 个；检查实例与目标发现。
+              environment: staging
+
+  # A removed target goes stale, not to up=0. The expected count still catches it.
+  - name: provider_target_disappears
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="dianping-provider",instance="provider-1:18081"}'
+        values: '1 1 stale _x10'
+      - series: 'up{job="dianping-provider",instance="provider-2:18082"}'
+        values: '1+0x12'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts:
+          - exp_labels:
+              job: dianping-provider
+              severity: warning
+            exp_annotations:
+              summary: 点评 Provider 指标抓取覆盖不足
+              description: Provider 成功抓取数低于期望值，当前少 1 个；检查实例与目标发现。
+              environment: staging
+
+  - name: all_provider_targets_missing
+    interval: 15s
+    external_labels:
+      environment: staging
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts:
+          - exp_labels:
+              job: dianping-provider
+              severity: warning
+            exp_annotations:
+              summary: 点评 Provider 指标抓取覆盖不足
+              description: Provider 成功抓取数低于期望值，当前少 2 个；检查实例与目标发现。
+              environment: staging
+      - eval_time: 1m15s
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+
+  - name: provider_scrape_coverage_recovers
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="dianping-provider",instance="provider-1:18081"}'
+        values: '0+0x6 1+0x8'
+      - series: 'up{job="dianping-provider",instance="provider-2:18082"}'
+        values: '1+0x15'
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts:
+          - exp_labels:
+              job: dianping-provider
+              severity: warning
+            exp_annotations:
+              summary: 点评 Provider 指标抓取覆盖不足
+              description: Provider 成功抓取数低于期望值，当前少 1 个；检查实例与目标发现。
+              environment: staging
+      - eval_time: 2m
+        alertname: DianpingProviderScrapeCoverageLow
+        exp_alerts: []
+
+  - name: web_scrape_failed
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="dianping-web",instance="web:18080"}'
+        values: '0+0x10'
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: DianpingWebScrapeFailed
+        exp_alerts:
+          - exp_labels:
+              job: dianping-web
+              instance: web:18080
+              severity: warning
+            exp_annotations:
+              summary: '点评 Web 指标抓取失败：web:18080'
+              description: Prometheus 连续 1 分钟无法抓取 Web 指标端点；请独立检查用户入口。
+              environment: staging
+      - eval_time: 1m15s
+        alertname: DianpingWebScrapeTargetMissing
+        exp_alerts: []
+
+  - name: web_target_missing
+    interval: 15s
+    external_labels:
+      environment: staging
+    alert_rule_test:
+      - eval_time: 1m15s
+        alertname: DianpingWebScrapeTargetMissing
+        exp_alerts:
+          - exp_labels:
+              job: dianping-web
+              severity: warning
+            exp_annotations:
+              summary: 点评 Web 抓取目标消失
+              description: Prometheus 中没有 dianping-web 的 up 时序；检查目标发现和抓取配置。
+              environment: staging
+      - eval_time: 1m15s
+        alertname: DianpingWebScrapeFailed
+        exp_alerts: []
+
+  - name: web_short_scrape_blip
+    interval: 15s
+    input_series:
+      - series: 'up{job="dianping-web",instance="web:18080"}'
+        values: '1 0 0 1+0x8'
+    alert_rule_test:
+      - eval_time: 1m30s
+        alertname: DianpingWebScrapeFailed
+        exp_alerts: []
+
+  # Exactly 5% does not satisfy a strict >5% condition.
+  - name: availability_rate_exact_threshold
+    interval: 15s
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="success"}'
+        values: '0+19x32'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="unavailable"}'
+        values: '0+1x32'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+
+  # Low request volume is deliberately not converted into a rate page.
+  - name: availability_rate_below_traffic_gate
+    interval: 15s
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="unavailable"}'
+        values: '0+1x10 10+0x20'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+
+  # Caller cancellations must not dilute either the ratio or its traffic gate.
+  - name: availability_rate_excludes_cancelled
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="success"}'
+        values: '0+1x28'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="unavailable"}'
+        values: '0+1x28'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="cancelled"}'
+        values: '0+40x28'
+    alert_rule_test:
+      - eval_time: 2m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+      - eval_time: 5m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts:
+          - exp_labels:
+              service: demo.Service
+              severity: critical
+            exp_annotations:
+              summary: 'RPC 调用可用性故障率升高：demo.Service'
+              description: 近 5 分钟至少 20 次非取消逻辑调用，超时、不可用、拒绝或协议错误比例持续超过 5%；当前 50%。
+              environment: staging
+
+  - name: availability_rate_survives_counter_reset
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="success"}'
+        values: '0+18x16 0+18x20'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="unavailable"}'
+        values: '0+2x16 0+2x20'
+    alert_rule_test:
+      - eval_time: 7m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts:
+          - exp_labels:
+              service: demo.Service
+              severity: critical
+            exp_annotations:
+              summary: 'RPC 调用可用性故障率升高：demo.Service'
+              description: 近 5 分钟至少 20 次非取消逻辑调用，超时、不可用、拒绝或协议错误比例持续超过 5%；当前 10%。
+              environment: staging
+
+  - name: availability_rate_recovers
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="success"}'
+        values: '0+18x56'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="unavailable"}'
+        values: '0+2x20 40+0x36'
+    alert_rule_test:
+      - eval_time: 4m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts:
+          - exp_labels:
+              service: demo.Service
+              severity: critical
+            exp_annotations:
+              summary: 'RPC 调用可用性故障率升高：demo.Service'
+              description: 近 5 分钟至少 20 次非取消逻辑调用，超时、不可用、拒绝或协议错误比例持续超过 5%；当前 10%。
+              environment: staging
+      - eval_time: 11m
+        alertname: RivetRpcClientHighAvailabilityFailureRate
+        exp_alerts: []
+
+  - name: sustained_latency_fires_after_hold
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'rivet_rpc_client_duration_seconds_bucket{job="dianping-web",service="demo.Service",outcome="success",le="2"}'
+        values: '0+0x32'
+      - series: 'rivet_rpc_client_duration_seconds_bucket{job="dianping-web",service="demo.Service",outcome="success",le="3"}'
+        values: '0+5x32'
+      - series: 'rivet_rpc_client_duration_seconds_bucket{job="dianping-web",service="demo.Service",outcome="success",le="+Inf"}'
+        values: '0+5x32'
+      - series: 'rivet_rpc_client_duration_seconds_count{job="dianping-web",service="demo.Service",outcome="success"}'
+        values: '0+5x32'
+    alert_rule_test:
+      - eval_time: 5m
+        alertname: RivetRpcClientHighP95Latency
+        exp_alerts: []
+      - eval_time: 6m
+        alertname: RivetRpcClientHighP95Latency
+        exp_alerts:
+          - exp_labels:
+              service: demo.Service
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 调用 P95 超过 2 秒：demo.Service'
+              description: 近 5 分钟至少 20 次非取消逻辑调用，P95 持续超过 2 秒；当前约 2.95 秒。
+              environment: staging
+
+  - name: probe_fresh_failures_then_recovery
+    interval: 15s
+    start_timestamp: '2026-11-23T00:00:00Z'
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '1+0x12'
+      - series: 'rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '0 1 2 3 3 0+0x7'
+      - series: 'rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '1795392000+15x12'
+    alert_rule_test:
+      - eval_time: 30s
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 45s
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              instance: web:18080
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: critical
+            exp_annotations:
+              summary: 'RPC 探针连续失败：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 'web:18080 的真实 RPC 探针最近一次结果新鲜，且连续失败至少 3 次。'
+              environment: staging
+      - eval_time: 1m15s
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m15s
+        alertname: RivetRpcProbeResultStale
+        exp_alerts: []
+
+  - name: probe_stale_result_is_monitoring_warning
+    interval: 15s
+    start_timestamp: '2026-11-23T00:00:00Z'
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '1+0x12'
+      - series: 'rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '3+0x12'
+      - series: 'rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '1795392000+0x12'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              instance: web:18080
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: critical
+            exp_annotations:
+              summary: 'RPC 探针连续失败：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 'web:18080 的真实 RPC 探针最近一次结果新鲜，且连续失败至少 3 次。'
+              environment: staging
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultStale
+        exp_alerts: []
+      - eval_time: 1m15s
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m15s
+        alertname: RivetRpcProbeResultStale
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              instance: web:18080
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 探针结果时间异常：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 'web:18080 的最近完成时间超过 60 秒未更新或位于未来；检查探针与时钟。'
+              environment: staging
+
+  - name: probe_future_timestamp_is_not_fresh
+    interval: 15s
+    start_timestamp: '2026-11-23T00:00:00Z'
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '1+0x8'
+      - series: 'rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '3+0x8'
+      - series: 'rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '1795392600+0x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultStale
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              instance: web:18080
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 探针结果时间异常：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 'web:18080 的最近完成时间超过 60 秒未更新或位于未来；检查探针与时钟。'
+              environment: staging
+
+  - name: probe_result_missing_despite_up
+    interval: 15s
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '1+0x8'
+      - series: 'rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '3+0x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultMissing
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 探针结果缺失：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 连续失败次数或最近完成时间指标缺失，不能判定 RPC 可用性。
+              environment: staging
+
+  - name: probe_failure_count_missing_despite_fresh_timestamp
+    interval: 15s
+    start_timestamp: '2026-11-23T00:00:00Z'
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '1+0x8'
+      - series: 'rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '1795392000+15x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultMissing
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              service: io.github.backoutside.rivet.dianping.api.RpcProbeService
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 探针结果缺失：io.github.backoutside.rivet.dianping.api.RpcProbeService'
+              description: 连续失败次数或最近完成时间指标缺失，不能判定 RPC 可用性。
+              environment: staging
+
+  - name: probe_target_scrape_failed
+    interval: 15s
+    start_timestamp: '2026-11-23T00:00:00Z'
+    external_labels:
+      environment: staging
+    input_series:
+      - series: 'up{job="rivet-rpc-probe",instance="web:18080"}'
+        values: '0+0x8'
+      - series: 'rivet_rpc_probe_consecutive_failures{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '3+0x8'
+      - series: 'rivet_rpc_probe_last_completed_timestamp_seconds{job="rivet-rpc-probe",instance="web:18080",service="io.github.backoutside.rivet.dianping.api.RpcProbeService"}'
+        values: '1795392000+15x8'
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultMissing
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultStale
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeScrapeFailed
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              instance: web:18080
+              severity: warning
+            exp_annotations:
+              summary: 'RPC 探针指标抓取失败：web:18080'
+              description: 探针指标端点不可抓取，不能据此断言 RPC 调用失败。
+              environment: staging
+
+  - name: probe_target_missing
+    interval: 15s
+    external_labels:
+      environment: staging
+    alert_rule_test:
+      - eval_time: 1m
+        alertname: RivetRpcProbeConsecutiveFailures
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeResultMissing
+        exp_alerts: []
+      - eval_time: 1m
+        alertname: RivetRpcProbeScrapeTargetMissing
+        exp_alerts:
+          - exp_labels:
+              job: rivet-rpc-probe
+              severity: warning
+            exp_annotations:
+              summary: RPC 探针抓取目标消失
+              description: Prometheus 中没有 rivet-rpc-probe 的 up 时序。
+              environment: staging

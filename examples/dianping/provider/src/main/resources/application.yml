@@ -25,12 +25,17 @@ rpc:
     bind-host: ${RPC_BIND_HOST:127.0.0.1}
     advertise-host: ${RPC_ADVERTISE_HOST:127.0.0.1}
     port: ${RPC_SERVER_PORT:19998}
+    max-inflight: ${RPC_MAX_INFLIGHT:256}
 
 management:
   endpoints:
     web:
       exposure:
-        include: health,info,metrics
+        include: health,info,metrics,prometheus
   endpoint:
     health:
-      show-details: always
+      show-details: never
+  metrics:
+    distribution:
+      slo:
+        "[rivet.rpc.server.duration]": 50ms,100ms,250ms,500ms,1s,2s,3s,5s

@@ -1,0 +1,16 @@
+route:
+  receiver: local-webhook
+  group_by: [environment, alertname, service, job]
+  group_wait: 10s
+  group_interval: 1m
+  repeat_interval: 4h
+  routes:
+    - receiver: local-webhook
+      matchers: ['severity="critical"']
+      group_wait: 5s
+
+receivers:
+  - name: local-webhook
+    webhook_configs:
+      - url: http://notification-receiver:8080/alerts
+        send_resolved: true
