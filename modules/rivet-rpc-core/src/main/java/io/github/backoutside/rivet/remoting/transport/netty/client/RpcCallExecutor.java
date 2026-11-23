@@ -21,6 +21,8 @@ import io.opentelemetry.api.trace.Span;
 
 import java.net.InetSocketAddress;
 import java.time.Duration;
+import java.util.ArrayList;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Objects;
 import java.util.UUID;
@@ -47,7 +49,8 @@ final class RpcCallExecutor {
 
     @FunctionalInterface
     interface Attempt {
-        RpcResponse<Object> send(RpcRequest request, InetSocketAddress address, long remainingNanos);
+        /** The deadline is an absolute value on the {@link System#nanoTime()} clock. */
+        RpcResponse<Object> send(RpcRequest request, InetSocketAddress address, long deadlineNanos);
     }
 
     private final RpcConfiguration config;
@@ -74,20 +77,24 @@ final class RpcCallExecutor {
                     "RPC client concurrent-call limit reached for " + service);
         }
         try {
-            List<InetSocketAddress> candidates = discover(request, deadline);
-            if (candidates == null) {
+            List<InetSocketAddress> discovered = discover(request, deadline);
+            if (discovered == null) {
                 throw new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, request.getRequestId(),
                         "RPC service discovery returned no candidate list for " + service, null);
             }
-            if (candidates.isEmpty()) {
+            if (discovered.isEmpty()) {
                 throw new RpcUnavailableException(RpcStatusCode.NO_PROVIDER, request.getRequestId(),
                         "No RPC provider for " + service, null);
             }
+            // A service discovery implementation may repeat an address. A logical call
+            // must never use the same provider twice or reserve time for a duplicate.
+            List<InetSocketAddress> candidates = new ArrayList<>(new LinkedHashSet<>(discovered));
             int allowedAttempts = request.isIdempotent()
                     ? Math.min(config.getMaxAttempts(), candidates.size()) : 1;
             AtomicInteger attempted = new AtomicInteger();
             RpcException lastFailure = null;
-            for (InetSocketAddress address : candidates) {
+            for (int candidateIndex = 0; candidateIndex < candidates.size(); candidateIndex++) {
+                InetSocketAddress address = candidates.get(candidateIndex);
                 if (attempted.get() >= allowedAttempts) {
                     break;
                 }
@@ -99,18 +106,41 @@ final class RpcCallExecutor {
                     throw new RpcUnavailableException(RpcStatusCode.DISCOVERY_FAILED, request.getRequestId(),
                             "RPC service discovery returned a null provider for " + service, null);
                 }
-                String breakerName = service + "@" + address.getHostString() + ":" + address.getPort();
+                String breakerName = breakerName(service, address);
                 CircuitBreaker breaker = breakers.computeIfAbsent(breakerName, ignored -> newBreaker(breakerName));
                 RpcRequest physical = copyWithNewId(request);
+                int position = candidateIndex;
+                int attemptsBefore = attempted.get();
                 try {
                     RpcResponse<Object> reply = breaker.executeSupplier(() -> {
+                        long attemptStarted = System.nanoTime();
+                        long remaining = deadline - attemptStarted;
+                        if (remaining <= 0) {
+                            throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
+                                    "RPC deadline exceeded before sending to " + address, null);
+                        }
+                        long budget = attemptBudgetNanos(request, service, candidates, position,
+                                allowedAttempts - attempted.get(), remaining);
+                        if (budget <= 0) {
+                            throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
+                                    "RPC deadline has no time left for an attempt to " + address, null);
+                        }
+                        long attemptDeadline = attemptStarted + budget;
+                        if (attemptDeadline - System.nanoTime() <= 0) {
+                            throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
+                                    "RPC attempt deadline exceeded before sending to " + address, null);
+                        }
                         int number = attempted.incrementAndGet();
                         if (number > 1) {
                             RpcMetrics.retry(service);
                             Span.current().addEvent("rivet.rpc.retry",
                                     Attributes.builder().put("rivet.rpc.attempt", number).build());
                         }
-                        RpcResponse<Object> result = attempt.send(physical, address, deadline - System.nanoTime());
+                        if (attemptDeadline - System.nanoTime() <= 0) {
+                            throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
+                                    "RPC attempt deadline exceeded before sending to " + address, null);
+                        }
+                        RpcResponse<Object> result = attempt.send(physical, address, attemptDeadline);
                         if (result == null) {
                             throw new RpcException(RpcStatusCode.INVALID_RESPONSE, request.getRequestId(),
                                     "Empty RPC response from " + address, null);
@@ -119,9 +149,9 @@ final class RpcCallExecutor {
                             throw new RpcException(RpcStatusCode.INVALID_RESPONSE, request.getRequestId(),
                                     "RPC response ID does not match request from " + address, null);
                         }
-                        if (deadline - System.nanoTime() <= 0) {
+                        if (attemptDeadline - System.nanoTime() <= 0) {
                             throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
-                                    "RPC deadline exceeded for " + service, null);
+                                    "RPC attempt deadline exceeded for " + service, null);
                         }
                         return result;
                     });
@@ -136,17 +166,23 @@ final class RpcCallExecutor {
                 } catch (CallNotPermittedException ex) {
                     RpcMetrics.rejection(service, "circuit");
                 } catch (RpcTimeoutException | RpcUnavailableException | RpcRejectedException ex) {
-                    RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    if (attempted.get() > attemptsBefore) {
+                        RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    }
                     lastFailure = ex;
                     if (!request.isIdempotent()
                             || ex.getKnownStatusCode() == RpcStatusCode.CALL_INTERRUPTED) {
                         throw forLogicalCall(ex, request.getRequestId());
                     }
                 } catch (RpcException ex) {
-                    RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    if (attempted.get() > attemptsBefore) {
+                        RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    }
                     throw forLogicalCall(ex, request.getRequestId());
                 } catch (RuntimeException ex) {
-                    RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    if (attempted.get() > attemptsBefore) {
+                        RpcMetrics.attempt(service, RpcMetrics.outcome(ex));
+                    }
                     throw ex;
                 }
             }
@@ -158,6 +194,41 @@ final class RpcCallExecutor {
         } finally {
             bulkhead.onComplete();
         }
+    }
+
+    private long attemptBudgetNanos(RpcRequest request, String service,
+                                    List<InetSocketAddress> candidates, int currentIndex,
+                                    int remainingAttemptSlots, long remainingNanos) {
+        if (!request.isIdempotent() || config.getPerAttemptTimeoutMs() == 0 || remainingAttemptSlots <= 1) {
+            return remainingNanos;
+        }
+        int possibleAttempts = 1;
+        for (int index = currentIndex + 1; index < candidates.size()
+                && possibleAttempts < remainingAttemptSlots; index++) {
+            InetSocketAddress next = candidates.get(index);
+            if (next == null) {
+                continue;
+            }
+            CircuitBreaker known = breakers.get(breakerName(service, next));
+            if (known != null) {
+                CircuitBreaker.State state = known.getState();
+                // This only sizes the current attempt. executeSupplier still decides
+                // whether a later circuit actually permits a call.
+                if (state == CircuitBreaker.State.OPEN || state == CircuitBreaker.State.FORCED_OPEN) {
+                    continue;
+                }
+            }
+            possibleAttempts++;
+        }
+        if (possibleAttempts == 1) {
+            return remainingNanos;
+        }
+        return Math.min(TimeUnit.MILLISECONDS.toNanos(config.getPerAttemptTimeoutMs()),
+                remainingNanos / possibleAttempts);
+    }
+
+    private static String breakerName(String service, InetSocketAddress address) {
+        return service + "@" + address.getHostString() + ":" + address.getPort();
     }
 
     private CircuitBreaker newBreaker(String name) {

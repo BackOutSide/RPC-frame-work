@@ -119,12 +119,11 @@ public final class NettyRpcClient implements RpcRequestTransport {
         }
     }
 
-    private RpcResponse<Object> sendAttempt(RpcRequest request, InetSocketAddress address, long remainingNanos) {
-        if (remainingNanos <= 0) {
+    private RpcResponse<Object> sendAttempt(RpcRequest request, InetSocketAddress address, long deadline) {
+        if (deadline - System.nanoTime() <= 0) {
             throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),
                     "RPC call timed out before sending " + request.getRpcServiceName(), null);
         }
-        long deadline = System.nanoTime() + remainingNanos;
         Channel channel = getChannel(address, deadline, request.getRequestId());
         if (deadline - System.nanoTime() <= 0) {
             throw new RpcTimeoutException(RpcStatusCode.RESPONSE_TIMEOUT, request.getRequestId(),

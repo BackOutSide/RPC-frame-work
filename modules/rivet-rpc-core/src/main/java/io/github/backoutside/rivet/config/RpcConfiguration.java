@@ -21,6 +21,7 @@ public final class RpcConfiguration {
     private final int serverPort;
     private final int connectTimeoutMs;
     private final int requestTimeoutMs;
+    private final int perAttemptTimeoutMs;
     private final String loadBalance;
     private final int maxAttempts;
     private final int maxConcurrentCalls;
@@ -37,6 +38,7 @@ public final class RpcConfiguration {
         serverPort = integerProperty(environment, "rpc.server.port", 9998, 0, 65535);
         connectTimeoutMs = integerProperty(environment, "rpc.client.connect-timeout-ms", 5000, 1, Integer.MAX_VALUE);
         requestTimeoutMs = integerProperty(environment, "rpc.client.timeout-ms", 3000, 1, Integer.MAX_VALUE);
+        perAttemptTimeoutMs = integerProperty(environment, "rpc.client.per-attempt-timeout-ms", 0, 0, Integer.MAX_VALUE);
         loadBalance = property(environment, "rpc.client.load-balance", null, "random");
         maxAttempts = integerProperty(environment, "rpc.client.max-attempts", 1, 1, 3);
         maxConcurrentCalls = integerProperty(environment, "rpc.client.max-concurrent-calls", 100, 1, 100000);
@@ -105,6 +107,7 @@ public final class RpcConfiguration {
     public int getServerPort() { return serverPort; }
     public int getConnectTimeoutMs() { return connectTimeoutMs; }
     public int getRequestTimeoutMs() { return requestTimeoutMs; }
+    public int getPerAttemptTimeoutMs() { return perAttemptTimeoutMs; }
     public String getLoadBalance() { return loadBalance; }
     public int getMaxAttempts() { return maxAttempts; }
     public int getMaxConcurrentCalls() { return maxConcurrentCalls; }

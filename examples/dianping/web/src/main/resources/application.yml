@@ -20,6 +20,7 @@ rpc:
     connect-timeout-ms: ${DIANPING_RPC_CONNECT_TIMEOUT_MS:5000}
     load-balance: ${DIANPING_RPC_LOAD_BALANCE:random}
     max-attempts: ${DIANPING_RPC_MAX_ATTEMPTS:2}
+    per-attempt-timeout-ms: ${DIANPING_RPC_PER_ATTEMPT_TIMEOUT_MS:0}
 
 dianping:
   demo-users:

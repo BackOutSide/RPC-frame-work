@@ -110,7 +110,13 @@ Prometheus 默认抓取两个 Provider 的 `18081` 和 `18082`。在 `/targets` 
 
 确认 ZooKeeper 中同一服务出现两个地址，再停止其中一个 Provider，连续调用 `GET /api/shops/1` 并查看 `rivet_rpc_client_retries_total`、`rivet_rpc_client_duration_seconds_count`。失效实例尚未被 ZooKeeper 摘除时，已标注幂等的读请求可在剩余预算内切换到另一实例。`POST /api/vouchers/1/seckill` 未标为幂等，不应期待框架自动重试；超时也不能证明远端没有执行。记录从故障到读请求稳定成功的时间；本仓库未预先给出生产 RTO。
 
-此演练只覆盖 RPC Provider 单实例退出，不能据此宣称注册中心故障切换已通过。框架层的其他故障场景和验收条件见[完整方案](../../docs/resilience-observability-plan.md)。
+可以在 Web 进程中设置 `DIANPING_RPC_PER_ATTEMPT_TIMEOUT_MS=800` 来试用客户端有界切换。默认值 `0` 保留原来的等待策略。启用后，幂等请求在还有其他候选且允许再次尝试时，会为后续候选预留时间。前一次尝试的预算涵盖建连和等待响应，最后一次尝试使用剩余总预算。这里的 800 毫秒用于联调，实际值按健康实例的延迟和故障演练结果选择。
+
+可用以下命令另测建连挂起、回包迟到、非幂等请求单次发送和双节点超时。测试用未完成的连接 Future 模拟建连挂起，响应故障走实际回环 TCP。
+
+```powershell
+mvn -B -ntp -pl modules/rivet-rpc-core -am '-Dtest=RpcCallExecutorTest,NettyBoundedFailoverIntegrationTest' '-Dsurefire.failIfNoSpecifiedTests=false' test
+```
 
 | 请求 | 结果 |
 | --- | --- |

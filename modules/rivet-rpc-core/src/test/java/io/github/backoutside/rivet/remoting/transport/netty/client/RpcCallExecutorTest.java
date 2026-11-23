@@ -24,7 +24,9 @@ import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.concurrent.atomic.AtomicLong;
 import java.util.concurrent.atomic.AtomicReference;
+import java.util.concurrent.locks.LockSupport;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -46,10 +48,10 @@ class RpcCallExecutorTest {
         List<InetSocketAddress> visited = new ArrayList<>();
         List<String> physicalIds = new ArrayList<>();
         RpcCallExecutor executor = new RpcCallExecutor(config(1000, 2, 10, 20, 5000),
-                discovery(FIRST, SECOND), (request, address, remaining) -> {
+                discovery(FIRST, SECOND), (request, address, deadlineNanos) -> {
                     visited.add(address);
                     physicalIds.add(request.getRequestId());
-                    assertTrue(remaining > 0);
+                    assertTrue(deadlineNanos - System.nanoTime() > 0);
                     if (address.equals(FIRST)) {
                         throw new RpcUnavailableException("connection failed");
                     }
@@ -66,6 +68,155 @@ class RpcCallExecutorTest {
         assertEquals("logical-id", response.getRequestId());
         assertEquals("second-provider", response.getData());
         assertEquals("logical-id", logical.getRequestId());
+    }
+
+    @Test
+    void optInCapsFirstAttemptRejectsLateReplyAndSkipsDuplicateCandidate() {
+        List<InetSocketAddress> visited = new ArrayList<>();
+        AtomicLong firstBudget = new AtomicLong();
+        AtomicLong secondBudget = new AtomicLong();
+        RpcCallExecutor executor = new RpcCallExecutor(config(1000, 2, 10, 20, 5000, 50),
+                discovery(FIRST, FIRST, SECOND), (request, address, deadlineNanos) -> {
+                    visited.add(address);
+                    if (FIRST.equals(address)) {
+                        firstBudget.set(deadlineNanos - System.nanoTime());
+                        long wakeAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(75);
+                        while (wakeAt - System.nanoTime() > 0) {
+                            LockSupport.parkNanos(wakeAt - System.nanoTime());
+                        }
+                        // A transport that ignores its timeout must not turn this late reply into success.
+                        return RpcResponse.success("late-first", request.getRequestId());
+                    }
+                    secondBudget.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("second", request.getRequestId());
+                });
+
+        RpcResponse<Object> response = executor.execute(request("bounded-id", true));
+
+        assertEquals("second", response.getData());
+        assertEquals(List.of(FIRST, SECOND), visited);
+        assertTrue(firstBudget.get() > 0);
+        assertTrue(firstBudget.get() <= TimeUnit.MILLISECONDS.toNanos(50));
+        assertTrue(secondBudget.get() > TimeUnit.MILLISECONDS.toNanos(50),
+                "the final attempt should receive the remaining logical deadline");
+    }
+
+    @Test
+    void optOutAndSingleOrNonIdempotentCallsKeepTheTotalBudget() {
+        AtomicLong optOutBudget = new AtomicLong();
+        RpcCallExecutor optOut = new RpcCallExecutor(config(2000, 2, 10, 20, 5000),
+                discovery(FIRST, SECOND), (request, address, deadlineNanos) -> {
+                    optOutBudget.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+        optOut.execute(request("opt-out", true));
+
+        AtomicLong singleBudget = new AtomicLong();
+        RpcCallExecutor single = new RpcCallExecutor(config(2000, 2, 10, 20, 5000, 25),
+                discovery(FIRST), (request, address, deadlineNanos) -> {
+                    singleBudget.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+        single.execute(request("single", true));
+
+        AtomicLong writeBudget = new AtomicLong();
+        RpcCallExecutor nonIdempotent = new RpcCallExecutor(config(2000, 2, 10, 20, 5000, 25),
+                discovery(FIRST, SECOND), (request, address, deadlineNanos) -> {
+                    writeBudget.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+        nonIdempotent.execute(request("write", false));
+
+        AtomicLong lastBudget = new AtomicLong();
+        RpcCallExecutor finalAttempt = new RpcCallExecutor(config(2000, 2, 10, 20, 5000, 25),
+                discovery(FIRST, SECOND), (request, address, deadlineNanos) -> {
+                    if (FIRST.equals(address)) {
+                        throw new RpcUnavailableException("first unavailable");
+                    }
+                    lastBudget.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+        finalAttempt.execute(request("final", true));
+
+        assertTrue(optOutBudget.get() > TimeUnit.MILLISECONDS.toNanos(1000));
+        assertTrue(singleBudget.get() > TimeUnit.MILLISECONDS.toNanos(1000));
+        assertTrue(writeBudget.get() > TimeUnit.MILLISECONDS.toNanos(1000));
+        assertTrue(lastBudget.get() > TimeUnit.MILLISECONDS.toNanos(1000));
+    }
+
+    @Test
+    void fairShareUsesTimeLeftAfterDiscovery() {
+        AtomicLong started = new AtomicLong();
+        ServiceDiscovery slowDiscovery = new ServiceDiscovery() {
+            @Override
+            public InetSocketAddress lookupService(RpcRequest request) {
+                return FIRST;
+            }
+
+            @Override
+            public List<InetSocketAddress> lookupServices(RpcRequest request) {
+                long wakeAt = System.nanoTime() + TimeUnit.MILLISECONDS.toNanos(120);
+                while (wakeAt - System.nanoTime() > 0) {
+                    LockSupport.parkNanos(wakeAt - System.nanoTime());
+                }
+                return List.of(FIRST, SECOND);
+            }
+        };
+        RpcCallExecutor executor = new RpcCallExecutor(config(1000, 2, 10, 20, 5000, 2000),
+                slowDiscovery, (request, address, deadlineNanos) -> {
+                    long remaining = deadlineNanos - System.nanoTime();
+                    long elapsed = System.nanoTime() - started.get();
+                    long approximateTimeLeft = TimeUnit.MILLISECONDS.toNanos(1000) - elapsed;
+                    assertTrue(elapsed >= TimeUnit.MILLISECONDS.toNanos(100));
+                    assertTrue(remaining > 0);
+                    assertTrue(remaining <= approximateTimeLeft / 2 + TimeUnit.MILLISECONDS.toNanos(20),
+                            "the first attempt must share the budget left after discovery");
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+
+        started.set(System.nanoTime());
+        assertEquals("ok", executor.execute(request("slow-discovery", true)).getData());
+    }
+
+    @Test
+    void knownOpenLaterCircuitDoesNotShortenTheOnlyCallableAttempt() {
+        AtomicInteger lookups = new AtomicInteger();
+        ServiceDiscovery changingDiscovery = new ServiceDiscovery() {
+            @Override
+            public InetSocketAddress lookupService(RpcRequest request) {
+                return SECOND;
+            }
+
+            @Override
+            public List<InetSocketAddress> lookupServices(RpcRequest request) {
+                return lookups.incrementAndGet() == 1 ? List.of(SECOND) : List.of(FIRST, SECOND);
+            }
+        };
+        AtomicLong remainingForFirst = new AtomicLong();
+        RpcCallExecutor executor = new RpcCallExecutor(config(2000, 2, 1, 1, 5000, 25),
+                changingDiscovery, (request, address, deadlineNanos) -> {
+                    if (SECOND.equals(address)) {
+                        throw new RpcUnavailableException("second provider down");
+                    }
+                    remainingForFirst.set(deadlineNanos - System.nanoTime());
+                    return RpcResponse.success("ok", request.getRequestId());
+                });
+
+        assertThrows(RpcUnavailableException.class, () -> executor.execute(request("prime-open", false)));
+        assertEquals("ok", executor.execute(request("known-open", true)).getData());
+        assertTrue(remainingForFirst.get() > TimeUnit.MILLISECONDS.toNanos(100),
+                "a known-open later circuit should not trigger the per-attempt cap");
+    }
+
+    @Test
+    void perAttemptTimeoutConfigurationDefaultsOffAndRejectsNegativeValues() {
+        assertEquals(0, config(1000, 2, 10, 20, 5000).getPerAttemptTimeoutMs());
+        assertEquals(25, config(1000, 2, 10, 20, 5000, 25).getPerAttemptTimeoutMs());
+
+        StandardEnvironment environment = new StandardEnvironment();
+        environment.getPropertySources().addFirst(new MapPropertySource("rpc-invalid-attempt-timeout-test",
+                Map.of("rpc.client.per-attempt-timeout-ms", -1)));
+        assertThrows(IllegalArgumentException.class, () -> RpcConfiguration.configure(environment));
     }
 
     @Test
@@ -235,9 +386,18 @@ class RpcCallExecutorTest {
 
     private static RpcConfiguration config(int timeoutMs, int maxAttempts,
                                            int minimumCalls, int windowSize, int openMs) {
+        return config(timeoutMs, maxAttempts, minimumCalls, windowSize, openMs, null);
+    }
+
+    private static RpcConfiguration config(int timeoutMs, int maxAttempts,
+                                           int minimumCalls, int windowSize, int openMs,
+                                           Integer perAttemptTimeoutMs) {
         Map<String, Object> values = new HashMap<>();
         values.put("rpc.client.timeout-ms", timeoutMs);
         values.put("rpc.client.max-attempts", maxAttempts);
+        if (perAttemptTimeoutMs != null) {
+            values.put("rpc.client.per-attempt-timeout-ms", perAttemptTimeoutMs);
+        }
         values.put("rpc.client.circuit.minimum-calls", minimumCalls);
         values.put("rpc.client.circuit.window-size", windowSize);
         values.put("rpc.client.circuit.open-ms", openMs);
